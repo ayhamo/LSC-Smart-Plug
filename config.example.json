@@ -1,0 +1,15 @@
+{
+  "device_id": "PASTE_FROM_TINYTUYA_WIZARD",
+  "local_key": "PASTE_FROM_TINYTUYA_WIZARD",
+  "ip": "192.168.1.50",
+  "version": 3.3,
+  "poll_seconds": 5,
+  "port": 8080,
+  "dps": {
+    "switch": 1,
+    "current": 18,
+    "power": 19,
+    "voltage": 20
+  },
+  "price_per_kwh": 0.3205
+}

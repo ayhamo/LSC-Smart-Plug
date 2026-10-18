@@ -1,0 +1,14 @@
+# secrets and personal data: never commit
+config.json
+state.json
+data/
+HOW_TO_RUN.md
+.claude/
+
+# measurements and demo data
+*.db
+demo_state.json
+
+# python
+__pycache__/
+*.pyc

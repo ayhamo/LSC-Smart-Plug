@@ -1,0 +1,11 @@
+data/
+*.db
+*.json
+!requirements.txt
+*.md
+*.bat
+.git/
+.github/
+.claude/
+__pycache__/
+docker/docker-compose.yml
