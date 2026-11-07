@@ -592,16 +592,21 @@ document.addEventListener("click", e => {
   else listEdit(b.dataset.kind, +b.dataset.i, b.dataset.op);
 });
 
-let busy = false;
+let busy = false, again = false;
 async function refresh() {
-  if (busy) return;           // a slow answer is still on its way: don't pile up requests
-  busy = true;
+  // A slow answer is still on its way: don't pile up requests, but run once more
+  // afterwards so a tab or device switch made meanwhile is not lost.
+  if (busy) { again = true; return; }
+  busy = true; again = false;
+  const want = PLUG, view = VIEW;
   let d, r;
   try {
-    r = await fetch("/api/status?" + (PLUG ? q() + "&" : "") + "device=" + encodeURIComponent(VIEW));
+    r = await fetch("/api/status?" + (want ? "plug=" + encodeURIComponent(want) + "&" : "") + "device=" + encodeURIComponent(view));
     d = await r.json();
   } catch { d = null; }
   busy = false;
+  // The answer is for a plug or device that is no longer selected: drop it and ask again
+  if (again || PLUG !== want || VIEW !== view) return refresh();
   if (r && r.status === 404 && PLUG) { PLUG = ""; return refresh(); }   // plug was removed from config.json
   if (!r || !r.ok || !d || !d.plug) { $("err").textContent = "Program not reachable"; return; }
   const first = !PLUG;
