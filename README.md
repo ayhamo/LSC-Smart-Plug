@@ -169,6 +169,11 @@ Notes:
 - One container handles all plugs; there is no need for a second one.
 - After a code change: copy `plug_server.py` / `index.html` and run
   `docker compose up -d --build`.
+- Prebuilt image: `ghcr.io/ayhamo/lsc-smart-plug:latest` (amd64 and arm64),
+  built by the GitHub workflow after the unit tests pass. It is rebuilt on every
+  push and on the 1st of each month, picking up the newest python:3.14-alpine,
+  Flask 3.x and tinytuya 1.x. A server using the image updates with
+  `docker compose pull && docker compose up -d`; your `data/` is not touched.
 
 **Stop any other copy of the program first.** Two programs polling the same
 plug at once make it drop connections.

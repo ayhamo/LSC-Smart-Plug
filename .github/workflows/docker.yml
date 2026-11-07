@@ -20,10 +20,16 @@ on:
       - .github/workflows/docker.yml
   pull_request:
   workflow_dispatch:
+  # Monthly rebuild on the 1st at 04:00 UTC: newest python:3.14-alpine (OS and
+  # Python security fixes) and newest Flask 3.x / tinytuya 1.x, tests first.
+  # The server still has to pull it: docker compose pull && docker compose up -d
+  schedule:
+    - cron: "0 4 1 * *"
 
 permissions:
   contents: read
   packages: write
+  actions: write     # only used to keep the monthly schedule enabled (see below)
 
 jobs:
   # Unit tests (simulated plugs, no network). The image is only built when they pass.
@@ -71,5 +77,15 @@ jobs:
           pull: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # The monthly run builds without cache, so pip installs the newest releases
+          no-cache: ${{ github.event_name == 'schedule' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # GitHub disables scheduled workflows in a public repo after 60 days without
+      # commits. Re-enabling it on every monthly run keeps the schedule alive.
+      - name: Keep the monthly schedule enabled
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/docker.yml/enable"
