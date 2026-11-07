@@ -1,15 +1,24 @@
 {
-  "device_id": "PASTE_FROM_TINYTUYA_WIZARD",
-  "local_key": "PASTE_FROM_TINYTUYA_WIZARD",
-  "ip": "192.168.1.50",
-  "version": 3.5,
   "poll_seconds": 5,
   "port": 8080,
-  "dps": {
-    "switch": 1,
-    "current": 18,
-    "power": 19,
-    "voltage": 20
-  },
-  "price_per_kwh": 0.3205
+  "price_per_kwh": 0.3205,
+  "plugs": [
+    {
+      "id": "1",
+      "name": "Living room",
+      "device_id": "PASTE_FROM_TINYTUYA_WIZARD",
+      "local_key": "PASTE_FROM_TINYTUYA_WIZARD",
+      "ip": "192.168.1.50",
+      "version": 3.5
+    },
+    {
+      "id": "2",
+      "name": "Kitchen",
+      "device_id": "PASTE_FROM_TINYTUYA_WIZARD",
+      "local_key": "PASTE_FROM_TINYTUYA_WIZARD",
+      "ip": "192.168.1.51",
+      "version": 3.5,
+      "dps": {"switch": 1, "current": 18, "power": 19, "voltage": 20}
+    }
+  ]
 }

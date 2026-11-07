@@ -9,3 +9,6 @@ data/
 .claude/
 __pycache__/
 docker/docker-compose.yml
+*.db-wal
+*.db-shm
+tests/

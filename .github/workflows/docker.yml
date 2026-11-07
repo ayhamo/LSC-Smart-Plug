@@ -15,8 +15,10 @@ on:
       - plug_server.py
       - index.html
       - requirements.txt
+      - tests/**
       - docker/**
       - .github/workflows/docker.yml
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -24,7 +26,20 @@ permissions:
   packages: write
 
 jobs:
+  # Unit tests (simulated plugs, no network). The image is only built when they pass.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -v
+
   build:
+    needs: test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

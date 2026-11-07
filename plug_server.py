@@ -1,5 +1,6 @@
 """
-Local controller for the LSC Smart Connect plug with power meter (Tuya, protocol 3.5).
+Local controller for LSC Smart Connect plugs with power meter (Tuya, protocol 3.5).
+One instance controls and monitors one or more plugs.
 
 Runs entirely on your LAN: no Tuya cloud, no Home Assistant.
 
@@ -10,23 +11,30 @@ Program features (need this program running):
     energy log + cost, weekly on/off schedules, alerts, auto-rediscovery
 
 Usage:
-    python plug_server.py            # real plug, reads config.json
-    python plug_server.py --demo     # simulated plug
+    python plug_server.py            # real plug(s), reads config.json
+    python plug_server.py --demo     # two simulated plugs
 """
 
 import base64
+import copy
+import csv
+import io
 import json
+import logging
 import math
 import os
+import re
 import sqlite3
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
+import uuid
 from calendar import monthrange
 from datetime import datetime, timedelta
 
-from flask import Flask, jsonify, request, Response
+from flask import Flask, Response, jsonify, request, stream_with_context
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("DATA_DIR", BASE)      # config/state/db live here (a volume in Docker)
@@ -36,47 +44,49 @@ DB_PATH = os.path.join(DATA, "energy.db")
 DEMO = "--demo" in sys.argv
 
 # Silence the per-request access log ("GET /api/status 200"); keep warnings/errors
-import logging
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 
 def log(msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
-# Data points of "LSC Power Plug EU incl. Power meter" (verified on the device)
-DP_SWITCH, DP_COUNTDOWN = "1", "9"
-DP_CURRENT, DP_POWER, DP_VOLTAGE = "18", "19", "20"   # mA, W*10, V*10
-DP_FAULT, DP_POWER_ON, DP_OVERCURRENT = "26", "38", "39"
-DP_LED, DP_CHILD_LOCK = "40", "41"
-DP_CYCLE, DP_RANDOM, DP_INCHING = "42", "43", "44"
-ENERGY_DPS = [int(DP_CURRENT), int(DP_POWER), int(DP_VOLTAGE)]
 
-# Names allowed in config.json "dps" -> the constant they override
-DP_NAMES = {"switch": "DP_SWITCH", "countdown": "DP_COUNTDOWN", "current": "DP_CURRENT",
-            "power": "DP_POWER", "voltage": "DP_VOLTAGE", "fault": "DP_FAULT",
-            "power_on": "DP_POWER_ON", "overcurrent": "DP_OVERCURRENT", "led": "DP_LED",
-            "child_lock": "DP_CHILD_LOCK", "cycle": "DP_CYCLE", "random": "DP_RANDOM",
-            "inching": "DP_INCHING"}
+# Data points of "LSC Power Plug EU incl. Power meter" (verified on the device).
+# A plug in config.json can override any of them with "dps": {"power": 19, ...}.
+DEFAULT_DPS = {"switch": 1, "countdown": 9, "current": 18, "power": 19, "voltage": 20,
+               "fault": 26, "power_on": 38, "overcurrent": 39, "led": 40,
+               "child_lock": 41, "cycle": 42, "random": 43, "inching": 44}
+
+POWER_ON_VALUES = ["off", "on", "memory"]
+LED_VALUES = ["relay", "pos", "none", "on"]   # verified on the device
+FAULT_BITS = ["overcurrent", "overvoltage", "overpower",
+              "low current", "low voltage", "low power"]
+DAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]   # bit 0 .. bit 6
+
+DEFAULT_POLL = 5          # seconds between readings
+GAP_POLLS = 3             # a gap longer than this many polls counts as "not measured"
+ALERT_COOLDOWN_S = 600    # the same alert is sent at most once per 10 minutes
+POWER_CLEAR = 0.95        # power alert clears below 95 % of the limit (no flapping)
+SCHED_CATCHUP_MIN = 15    # schedules missed by up to 15 min (slow pass, DST) still run
+SCHED_TRIES = 3           # a failed scheduled switch is retried this many times
+SUMMARY_CACHE_S = 30      # page totals are recomputed at most every 30 s
+URL_MASK = "•••"
+ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
+HM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 
-def apply_dps(overrides):
-    """Use the data point numbers from config.json "dps" instead of the defaults."""
-    global ENERGY_DPS
-    g = globals()
-    for name, num in (overrides or {}).items():
-        if name not in DP_NAMES:
-            log(f"config.json: unknown dps entry '{name}' ignored "
-                f"(known: {', '.join(DP_NAMES)})")
-            continue
-        g[DP_NAMES[name]] = str(int(num))
-    ENERGY_DPS = [int(DP_CURRENT), int(DP_POWER), int(DP_VOLTAGE)]
+class ApiError(Exception):
+    """Bad request data. Turned into {"ok": false, "error": msg} with this HTTP code."""
+    def __init__(self, msg, code=400):
+        super().__init__(msg)
+        self.code = code
 
 
 def write_json(path, obj):
     """Write a JSON file so a crash mid-write never leaves it half written."""
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(obj, f, indent=2)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
         f.flush()
         os.fsync(f.fileno())
     try:
@@ -84,14 +94,95 @@ def write_json(path, obj):
     except OSError:
         # The file itself is a bind mount (can't be replaced): write it in place
         os.remove(tmp)
-        with open(path, "w") as f:
-            json.dump(obj, f, indent=2)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, ensure_ascii=False)
 
-POWER_ON_VALUES = ["off", "on", "memory"]
-LED_VALUES = ["relay", "pos", "none", "on"]   # verified on the device
-FAULT_BITS = ["overcurrent", "overvoltage", "overpower",
-              "low current", "low voltage", "low power"]
-DAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]   # bit 0 .. bit 6
+
+# --------------------------------------------------------------------------
+# Input checks (shared by the API and by state.json loading)
+# --------------------------------------------------------------------------
+
+def check_hm(v, what="time"):
+    if not isinstance(v, str) or not HM_RE.match(v):
+        raise ApiError(f"{what} must be HH:MM (00:00–23:59)")
+    return v
+
+
+def check_days(v):
+    if not isinstance(v, list) or not v or any(d not in DAYS for d in v):
+        raise ApiError(f"days must be a non-empty list of {', '.join(DAYS)}")
+    return [d for d in DAYS if d in v]
+
+
+def check_int(v, lo, hi, what):
+    if isinstance(v, bool):
+        raise ApiError(f"{what} must be a whole number")
+    try:
+        n = int(v)
+        if n != float(v):
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        raise ApiError(f"{what} must be a whole number") from None
+    if not lo <= n <= hi:
+        raise ApiError(f"{what} must be between {lo} and {hi}")
+    return n
+
+
+def check_num(v, what, lo=0.0):
+    if isinstance(v, bool):
+        raise ApiError(f"{what} must be a number")
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        raise ApiError(f"{what} must be a number") from None
+    if not math.isfinite(n) or n < lo:
+        raise ApiError(f"{what} must be a number ≥ {lo:g}")
+    return n
+
+
+def check_name(v, what="name", maxlen=40):
+    name = " ".join(str(v if v is not None else "").split())[:maxlen]
+    if not name:
+        raise ApiError(f"{what} is empty")
+    return name
+
+
+def clean_schedule(s):
+    if not isinstance(s, dict):
+        raise ApiError("schedule must be an object")
+    if s.get("action") not in ("on", "off"):
+        raise ApiError("action must be on or off")
+    sid = s.get("id")
+    return {"id": sid if isinstance(sid, str) and ID_RE.match(sid) else uuid.uuid4().hex[:8],
+            "time": check_hm(s.get("time")), "action": s["action"],
+            "days": check_days(s.get("days")), "enabled": bool(s.get("enabled", True))}
+
+
+def clean_cycle(tasks):
+    if not isinstance(tasks, list) or len(tasks) > 10:
+        raise ApiError("cycle timers: a list of at most 10")
+    out = []
+    for t in tasks:
+        if not isinstance(t, dict):
+            raise ApiError("cycle timer must be an object")
+        out.append({"enabled": bool(t.get("enabled", True)), "days": check_days(t.get("days")),
+                    "start": check_hm(t.get("start"), "start"), "end": check_hm(t.get("end"), "end"),
+                    "on_min": check_int(t.get("on_min"), 1, 1439, "on minutes"),
+                    "off_min": check_int(t.get("off_min"), 1, 1439, "off minutes")})
+    return out
+
+
+def clean_random(tasks):
+    if not isinstance(tasks, list) or len(tasks) > 16:
+        raise ApiError("random timers: a list of at most 16")
+    out = []
+    for t in tasks:
+        if not isinstance(t, dict):
+            raise ApiError("random timer must be an object")
+        out.append({"enabled": bool(t.get("enabled", True)), "days": check_days(t.get("days")),
+                    "start": check_hm(t.get("start"), "start"), "end": check_hm(t.get("end"), "end")})
+    return out
+
 
 # --------------------------------------------------------------------------
 # Binary formats of the on-plug timers (base64 strings)
@@ -120,7 +211,7 @@ def _b64(raw):
 
 def _unb64(s):
     try:
-        return base64.b64decode(s) if s else b""
+        return base64.b64decode(s) if isinstance(s, str) and s else b""
     except Exception:
         return b""
 
@@ -181,59 +272,114 @@ def decode_inching(s):
 
 
 # --------------------------------------------------------------------------
-# Plug backends: get_dps() -> dict, set_dp(dp, value)
+# Parsing raw data points into something readable
 # --------------------------------------------------------------------------
 
-class DemoPlug:
+def parse(d, dp):
+    """Raw data points -> readable status. Unexpected value types never raise."""
+    def scaled(name, scale):
+        v = d.get(dp[name])
+        if v is None or isinstance(v, bool):
+            return None
+        try:
+            return round(float(v) / scale, 3)
+        except (TypeError, ValueError):
+            return None
+
+    def whole(name):
+        try:
+            return int(d.get(dp[name]) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def text(name):
+        v = d.get(dp[name])
+        return v if isinstance(v, str) else ""
+
+    fault = whole("fault")
+    return {
+        "on": d.get(dp["switch"]) is True,
+        "power_w": scaled("power", 10),
+        "voltage_v": scaled("voltage", 10),
+        "current_a": scaled("current", 1000),
+        "countdown_s": whole("countdown"),
+        "faults": [name for i, name in enumerate(FAULT_BITS) if fault & (1 << i)],
+        "power_on": d.get(dp["power_on"]),
+        "overcurrent": d.get(dp["overcurrent"]),
+        "led": d.get(dp["led"]),
+        "child_lock": d.get(dp["child_lock"]),
+        "inching": decode_inching(text("inching")),
+        "cycle": decode_cycle(text("cycle")),
+        "random": decode_random(text("random")),
+    }
+
+
+# --------------------------------------------------------------------------
+# Plug backends: get_dps() -> dict, set_dp(dp, value) -> dict of confirmed dps
+# --------------------------------------------------------------------------
+
+class DemoBackend:
     """Simulated plug that behaves like the real one, for trying the UI."""
-    def __init__(self):
-        self.d = {DP_SWITCH: False, DP_COUNTDOWN: 0, DP_FAULT: 0,
-                  DP_POWER_ON: "memory", DP_OVERCURRENT: False, DP_LED: "relay",
-                  DP_CHILD_LOCK: False, DP_CYCLE: "", DP_RANDOM: "", DP_INCHING: ""}
+    def __init__(self, dp, watts=1400.0):
+        self.dp, self.watts = dp, float(watts)
+        self.d = {dp["switch"]: False, dp["countdown"]: 0, dp["fault"]: 0,
+                  dp["power_on"]: "memory", dp["overcurrent"]: False, dp["led"]: "relay",
+                  dp["child_lock"]: False, dp["cycle"]: "", dp["random"]: "", dp["inching"]: ""}
         self.t0 = time.time()
         self.cd_end = None
         self.inch_end = None
+        self.lock = threading.Lock()
 
     def _tick(self):
         now = time.time()
+        sw = self.dp["switch"]
         if self.cd_end and now >= self.cd_end:
-            self.d[DP_SWITCH] = not self.d[DP_SWITCH]
+            self.d[sw] = not self.d[sw]
             self.cd_end = None
         if self.inch_end and now >= self.inch_end:
-            self.d[DP_SWITCH] = False
+            self.d[sw] = False
             self.inch_end = None
-        self.d[DP_COUNTDOWN] = int(self.cd_end - now) if self.cd_end else 0
+        self.d[self.dp["countdown"]] = int(self.cd_end - now) if self.cd_end else 0
 
     def get_dps(self):
-        self._tick()
-        w = (1400 + 120 * math.sin((time.time() - self.t0) / 9)) if self.d[DP_SWITCH] else 0
-        self.d[DP_POWER] = int(w * 10)
-        self.d[DP_VOLTAGE] = 2318
-        self.d[DP_CURRENT] = int(w / 231.8 * 1000)
-        return dict(self.d)
+        with self.lock:
+            self._tick()
+            on = self.d[self.dp["switch"]]
+            w = self.watts * (1 + 0.08 * math.sin((time.time() - self.t0) / 9)) if on else 0
+            self.d[self.dp["power"]] = int(w * 10)
+            self.d[self.dp["voltage"]] = 2318
+            self.d[self.dp["current"]] = int(w / 231.8 * 1000)
+            return dict(self.d)
 
     def set_dp(self, dp, value):
-        dp = str(dp)
-        self.d[dp] = value
-        if dp == DP_COUNTDOWN:
-            self.cd_end = time.time() + int(value) if int(value) else None
-        if dp == DP_SWITCH and value:
-            inch = decode_inching(self.d[DP_INCHING])
-            if inch["enabled"]:
-                self.inch_end = time.time() + inch["seconds"]
+        with self.lock:
+            self.d[dp] = value
+            if dp == self.dp["countdown"]:
+                self.cd_end = time.time() + int(value) if int(value) else None
+            if dp == self.dp["switch"] and value:
+                inch = decode_inching(self.d[self.dp["inching"]])
+                if inch["enabled"]:
+                    self.inch_end = time.time() + inch["seconds"]
+            return {dp: value}
 
 
-class TuyaPlug:
-    def __init__(self, cfg):
-        self.cfg = cfg
+class TuyaBackend:
+    def __init__(self, pcfg, dp, on_new_ip):
+        self.cfg = pcfg
+        self.dp = dp
+        self.on_new_ip = on_new_ip      # called with the new IP after rediscovery
+        self.energy_dps = [int(dp["current"]), int(dp["power"]), int(dp["voltage"])]
         self.lock = threading.Lock()
         self._connect()
+
+    def _version(self):
+        return float(self.cfg.get("version", 3.5))
 
     def _connect(self):
         import tinytuya
         self.dev = tinytuya.OutletDevice(
             dev_id=self.cfg["device_id"], address=self.cfg["ip"],
-            local_key=self.cfg["local_key"], version=float(self.cfg.get("version", 3.5)))
+            local_key=self.cfg["local_key"], version=self._version())
         # A fresh short connection per request. A long-lived connection collected
         # unread replies from the plug, so readings fell further and further behind.
         self.dev.set_socketPersistent(False)
@@ -260,7 +406,7 @@ class TuyaPlug:
             candidates = [ip for ip in ex.map(port_open, (f"{prefix}.{i}" for i in range(1, 255))) if ip]
         for ip in candidates:
             d = tinytuya.OutletDevice(self.cfg["device_id"], ip, self.cfg["local_key"],
-                                      version=float(self.cfg.get("version", 3.5)))
+                                      version=self._version())
             d.set_socketTimeout(3)
             d.set_socketRetryLimit(1)
             r = d.status()
@@ -288,11 +434,7 @@ class TuyaPlug:
                 except Exception:
                     pass
                 self._connect()
-            # Persist so the next start uses the new IP
-            with open(CONFIG_PATH) as f:
-                disk = json.load(f)
-            disk["ip"] = ip
-            write_json(CONFIG_PATH, disk)
+            self.on_new_ip(ip)
             return ip
         return None
 
@@ -301,7 +443,7 @@ class TuyaPlug:
             try:
                 # Ask for fresh power readings. This plug never replies to the
                 # request itself, so don't wait for one (waiting cost 5 s).
-                self.dev.updatedps(ENERGY_DPS, nowait=True)
+                self.dev.updatedps(self.energy_dps, nowait=True)
             except Exception:
                 pass
             raw = self.dev.status()
@@ -314,50 +456,258 @@ class TuyaPlug:
             r = self.dev.set_value(int(dp), value)
         if r and "Error" in r:
             raise RuntimeError(r["Error"])
-        if r and isinstance(r.get("dps"), dict):
-            last["dps"].update(r["dps"])   # the plug confirms the new value right away
+        # the plug confirms the new value right away
+        return r["dps"] if r and isinstance(r.get("dps"), dict) else {}
 
 
 # --------------------------------------------------------------------------
-# State (server-side schedules, settings, alerts)
+# Plugs
 # --------------------------------------------------------------------------
 
-state_lock = threading.Lock()
-state = {
-    "schedules": [],
+class Plug:
+    def __init__(self, pcfg, demo=False):
+        self.id = pcfg["id"]
+        self.cfg = pcfg
+        self.config_name = pcfg.get("name") or f"Plug {self.id}"
+        dps = dict(DEFAULT_DPS)
+        for k, v in (pcfg.get("dps") or {}).items():
+            if k not in DEFAULT_DPS:
+                log(f"config.json: plug {self.id}: unknown dps entry '{k}' ignored "
+                    f"(known: {', '.join(DEFAULT_DPS)})")
+                continue
+            dps[k] = int(v)
+        self.dp = {k: str(v) for k, v in dps.items()}
+        self.last = {"dps": {}, "error": None, "ts": 0, "fail_count": 0}
+        self.sched_last = None      # last minute the schedules were checked for
+        self.sched_retry = []       # (schedule, minute, tries) of failed scheduled switches
+        self.power_alert = False
+        if demo:
+            self.backend = DemoBackend(self.dp, pcfg.get("demo_w", 1400))
+        else:
+            self.backend = TuyaBackend(pcfg, self.dp, lambda ip: persist_ip(self.id, ip))
+
+    @property
+    def name(self):
+        """The name set in the page wins over the one in config.json."""
+        return state["plugs"].get(self.id, {}).get("name") or self.config_name
+
+    def status(self):
+        return parse(self.last["dps"], self.dp) if self.last["dps"] else None
+
+    def read(self):
+        self.last["dps"].update(self.backend.get_dps())
+        return parse(self.last["dps"], self.dp)
+
+    def set(self, name, value):
+        confirmed = self.backend.set_dp(self.dp[name], value)
+        self.last["dps"].update(confirmed or {})
+
+    def switch(self, on, reason=""):
+        """Switch the relay. Returns None on success, else the error text."""
+        try:
+            self.set("switch", bool(on))
+            log(f"{self.name}: plug -> {'ON' if on else 'OFF'} {reason}".rstrip())
+            return None
+        except Exception as e:
+            log(f"{self.name}: switch {'on' if on else 'off'} failed {reason}: {e}")
+            return str(e) or e.__class__.__name__
+
+    def refresh(self):
+        try:
+            self.read()
+            self.last.update(error=None, ts=time.time())
+        except Exception as e:
+            self.last.update(error=str(e))
+
+    def overview(self):
+        st = self.status() or {}
+        return {"id": self.id, "name": self.name, "on": st.get("on"), "power_w": st.get("power_w"),
+                "error": self.last["error"], "updated": self.last["ts"]}
+
+
+PLUGS = {}                 # id -> Plug, in config order
+cfg = {"poll_seconds": DEFAULT_POLL, "port": 8080, "title": "Smart Plug"}
+config_lock = threading.Lock()
+PLUG_KEYS = ("id", "name", "device_id", "local_key", "ip", "version", "dps",
+             "product", "mac", "model")
+DEMO_CONFIG = {"poll_seconds": 2, "port": 8081, "plugs": [
+    {"id": "1", "name": "Demo heater", "demo_w": 1400},
+    {"id": "2", "name": "Demo fridge", "demo_w": 90}]}
+
+
+def plug_configs(raw, demo=False):
+    """The plugs in config.json. An old single-plug config (device_id/local_key/ip at
+    the top level) becomes plug "1"."""
+    if "plugs" in raw:
+        entries = raw["plugs"]
+    else:
+        entries = [{k: raw[k] for k in PLUG_KEYS if k in raw}]
+    if not isinstance(entries, list) or not entries:
+        raise ValueError('config.json: "plugs" must be a non-empty list')
+    out, seen = [], set()
+    for i, p in enumerate(entries):
+        if not isinstance(p, dict):
+            raise ValueError(f"config.json: plug #{i + 1} must be an object")
+        pid = str(p.get("id") or i + 1)
+        if not ID_RE.match(pid):
+            raise ValueError(f"config.json: plug id '{pid}' may only use letters, digits, - and _")
+        if pid in seen:
+            raise ValueError(f"config.json: plug id '{pid}' is used twice")
+        if not demo:
+            missing = [k for k in ("device_id", "local_key", "ip") if not p.get(k)]
+            if missing:
+                raise ValueError(f"config.json: plug {pid} is missing {', '.join(missing)}")
+        seen.add(pid)
+        out.append({**p, "id": pid})
+    return out
+
+
+def persist_ip(pid, ip):
+    """Store a plug's new IP in config.json so the next start uses it."""
+    if DEMO:
+        return
+    with config_lock:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            disk = json.load(f)
+        if "plugs" in disk:
+            for i, p in enumerate(disk["plugs"]):
+                if str(p.get("id") or i + 1) == pid:
+                    p["ip"] = ip
+        else:
+            disk["ip"] = ip
+        write_json(CONFIG_PATH, disk)
+    log(f"{PLUGS[pid].name}: found at new IP {ip}, config.json updated")
+
+
+# --------------------------------------------------------------------------
+# State (settings, schedules, alerts) in state.json
+# --------------------------------------------------------------------------
+
+DEFAULT_STATE = {
     "price_per_kwh": 0.3205,
-    "device": "AC",          # label stamped on every reading: what is plugged in right now
-    "alerts": {"power_above_w": 0, "notify_url": "", "budget_eur": 0, "monthly_report": False},
+    "alerts": {"notify_url": "", "budget_eur": 0, "monthly_report": False},
     "last_report": "",       # "YYYY-MM" of the month the last report was sent in
+    "budget_alerted": "",    # "YYYY-MM" of the month the budget alert was sent in
+    "plugs": {},             # id -> {"name", "device", "schedules", "power_above_w"}
 }
-last = {"dps": {}, "error": None, "ts": 0, "fail_count": 0}
-alerts_log = []          # recent alert messages shown on the page
-_alert_flags = {}        # alert key -> currently active
+state_lock = threading.RLock()
+state = copy.deepcopy(DEFAULT_STATE)
 
 
-def load_state(cfg):
-    if "price_per_kwh" in cfg:
-        state["price_per_kwh"] = cfg["price_per_kwh"]
+def _num_or(v, default):
+    try:
+        n = float(v)
+        return n if math.isfinite(n) and n >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def load_state(raw_cfg):
+    """Read state.json. A file from the single-plug version (schedules, device and
+    the power limit at the top level) is moved to the first plug."""
+    state.clear()
+    state.update(copy.deepcopy(DEFAULT_STATE))
+    if "price_per_kwh" in raw_cfg:
+        state["price_per_kwh"] = _num_or(raw_cfg["price_per_kwh"], state["price_per_kwh"])
+    saved = {}
     if os.path.exists(STATE_PATH):
-        with open(STATE_PATH) as f:
+        with open(STATE_PATH, encoding="utf-8") as f:
             saved = json.load(f)
-        saved.pop("timer", None)      # old server-side timer, replaced by on-plug countdown
-        state.update(saved)
+    saved.pop("timer", None)      # old server-side timer, replaced by on-plug countdown
+    first = next(iter(PLUGS))
+    legacy = {k: saved.pop(k) for k in ("schedules", "device") if k in saved}
+    alerts = saved.pop("alerts", {}) or {}
+    if "power_above_w" in alerts:
+        legacy["power_above_w"] = alerts.pop("power_above_w")
+    plugs = saved.pop("plugs", {}) or {}
+    if legacy and first not in plugs:
+        plugs[first] = legacy
+    state["alerts"].update({k: v for k, v in alerts.items() if k in DEFAULT_STATE["alerts"]})
+    state["alerts"]["budget_eur"] = _num_or(state["alerts"].get("budget_eur"), 0)
+    state["alerts"]["monthly_report"] = bool(state["alerts"].get("monthly_report"))
+    state["alerts"]["notify_url"] = str(state["alerts"].get("notify_url") or "")
+    for k in ("price_per_kwh", "last_report", "budget_alerted"):
+        if k in saved:
+            state[k] = saved[k]
+    state["price_per_kwh"] = _num_or(state["price_per_kwh"], DEFAULT_STATE["price_per_kwh"])
+    # Keep entries of plugs that are not in config.json right now (e.g. commented out)
+    state["plugs"] = {pid: dict(ps) for pid, ps in plugs.items() if isinstance(ps, dict)}
+    for pid in PLUGS:
+        ps = state["plugs"].setdefault(pid, {})
+        ps.setdefault("device", "AC" if pid == first and "device" not in ps and legacy else
+                      (ps.get("name") or PLUGS[pid].config_name))
+        ps["power_above_w"] = _num_or(ps.get("power_above_w"), 0)
+        good = []
+        for s in ps.get("schedules") or []:
+            try:
+                good.append(clean_schedule(s))
+            except ApiError as e:
+                log(f"state.json: plug {pid}: dropped invalid schedule {s!r}: {e}")
+        ps["schedules"] = sorted(good, key=lambda s: s["time"])
+    save_state()
 
 
 def save_state():
     write_json(STATE_PATH, state)
 
 
-def raise_alert(key, active, message):
-    """Record an alert once when it becomes active."""
-    was = _alert_flags.get(key, False)
-    _alert_flags[key] = active
-    if active and not was:
-        alerts_log.insert(0, {"ts": time.time(), "msg": message})
-        del alerts_log[50:]
-        log(f"ALERT: {message}")
+def plug_state(pid):
+    return state["plugs"][pid]
+
+
+# --------------------------------------------------------------------------
+# Alerts and notifications
+# --------------------------------------------------------------------------
+
+alerts_lock = threading.Lock()
+alerts_log = []          # recent alert messages shown on the page
+_alerts = {}             # alert key -> {"active": bool, "sent": time of last notification}
+
+
+def _record(key, message):
+    """Show an alert on the page and send it, at most once per cooldown per key."""
+    now = time.time()
+    a = _alerts.setdefault(key, {"active": False, "sent": 0})
+    alerts_log.insert(0, {"ts": now, "msg": message})
+    del alerts_log[50:]
+    log(f"ALERT: {message}")
+    if now - a["sent"] >= ALERT_COOLDOWN_S:
+        a["sent"] = now
         threading.Thread(target=notify, args=(message,), daemon=True).start()
+
+
+def set_alert(key, active, message=""):
+    """A condition alert: recorded once when it becomes active."""
+    with alerts_lock:
+        a = _alerts.setdefault(key, {"active": False, "sent": 0})
+        if active and not a["active"]:
+            a["active"] = True
+            _record(key, message)
+        elif not active:
+            a["active"] = False
+
+
+def alert_once(key, message):
+    """A one-off event (back online, failed schedule, budget, …)."""
+    with alerts_lock:
+        _record(key, message)
+
+
+def alert_active(key):
+    with alerts_lock:
+        return _alerts.get(key, {}).get("active", False)
+
+
+def mask_url(url):
+    """'https://discord.com/api/webhooks/123/abc' -> 'https://discord.com/•••'."""
+    url = (url or "").strip()
+    if not url:
+        return ""
+    p = urllib.parse.urlsplit(url)
+    if not (p.scheme and p.hostname):
+        return URL_MASK
+    host = p.hostname + (f":{p.port}" if p.port else "")
+    return f"{p.scheme}://{host}/{URL_MASK}"
 
 
 def notify(message):
@@ -367,7 +717,7 @@ def notify(message):
     url = (state["alerts"].get("notify_url") or "").strip()
     if not url:
         return "no notification URL set"
-    name = cfg.get("name", "Smart Plug")
+    name = cfg.get("title", "Smart Plug")
     headers = {"User-Agent": "SmartPlug/1.0"}   # Discord rejects Python's default agent
     if "discord.com/api/webhooks" in url or "discordapp.com/api/webhooks" in url:
         body = json.dumps({"username": name, "content": f"**{name}:** {message}"}).encode()
@@ -388,6 +738,10 @@ def notify(message):
 # Energy database
 # --------------------------------------------------------------------------
 
+SCHEMA = """CREATE TABLE IF NOT EXISTS readings (
+    plug TEXT NOT NULL, ts INTEGER NOT NULL, on_state INTEGER, power_w REAL,
+    voltage_v REAL, current_a REAL, wh REAL, device TEXT NOT NULL,
+    PRIMARY KEY (plug, ts)) WITHOUT ROWID"""
 _db_ready = False
 _db_init_lock = threading.Lock()
 
@@ -398,46 +752,82 @@ def db():
     if not _db_ready:
         with _db_init_lock:
             if not _db_ready:
-                # WAL: page queries (readers) no longer block the poll loop (writer)
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("""CREATE TABLE IF NOT EXISTS readings (
-                    ts INTEGER PRIMARY KEY, on_state INTEGER, power_w REAL,
-                    voltage_v REAL, current_a REAL, wh REAL, device TEXT NOT NULL DEFAULT 'AC')""")
-                cols = [r[1] for r in conn.execute("PRAGMA table_info(readings)")]
-                if "device" not in cols:   # database from before the device label existed
-                    conn.execute("ALTER TABLE readings ADD COLUMN device TEXT NOT NULL DEFAULT 'AC'")
-                conn.commit()
+                _init_db(conn)
                 _db_ready = True
     return conn
 
 
-def log_reading(st, elapsed_s):
+def _init_db(conn):
+    # WAL: page queries (readers) never block the poll loops (writers)
+    conn.execute("PRAGMA journal_mode=WAL")
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(readings)")]
+    if cols and "plug" not in cols:
+        # Database of the single-plug version: one row per second, no plug column.
+        # Move every reading to the first plug.
+        first = next(iter(PLUGS), "1")
+        device = "COALESCE(device, 'AC')" if "device" in cols else "'AC'"
+        t = time.time()
+        conn.isolation_level = None
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("ALTER TABLE readings RENAME TO readings_v1")
+            conn.execute(SCHEMA)
+            n = conn.execute(f"""INSERT INTO readings
+                SELECT ?, ts, on_state, power_w, voltage_v, current_a, wh, {device}
+                FROM readings_v1""", (first,)).rowcount
+            conn.execute("DROP TABLE readings_v1")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.isolation_level = ""
+        log(f"database upgraded for several plugs: {n} readings moved to plug {first} "
+            f"in {time.time() - t:.1f} s")
+        conn.execute("CREATE INDEX IF NOT EXISTS readings_ts ON readings(ts)")
+        conn.commit()
+        conn.execute("VACUUM")      # give back the old table's space (the file would double)
+    conn.execute(SCHEMA)
+    conn.execute("CREATE INDEX IF NOT EXISTS readings_ts ON readings(ts)")
+    conn.commit()
+
+
+def log_reading(pid, st, elapsed_s, device):
     p = st.get("power_w") or 0.0
     conn = db()
-    conn.execute("INSERT OR REPLACE INTO readings VALUES (?,?,?,?,?,?,?)",
-                 (int(time.time()), int(st["on"]), p, st.get("voltage_v"),
-                  st.get("current_a"), p * elapsed_s / 3600.0, state["device"]))
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("INSERT OR REPLACE INTO readings VALUES (?,?,?,?,?,?,?,?)",
+                     (pid, int(time.time()), int(st["on"]), p, st.get("voltage_v"),
+                      st.get("current_a"), p * elapsed_s / 3600.0, device))
+        conn.commit()
+    finally:
+        conn.close()
 
 
-def dev_where(device):
-    """SQL fragment + params that limit a query to one device label ('' = all)."""
-    return (" AND device = ?", (device,)) if device else ("", ())
+def where(pid, device=""):
+    """SQL fragment + params limiting a query to one plug and maybe one device label."""
+    if device:
+        return " AND plug = ? AND device = ?", (pid, device)
+    return " AND plug = ?", (pid,)
 
 
-def period_stats(conn, since, poll, price, device=""):
+def midnight(d, days_back=0):
+    """Local midnight `days_back` days before d, as a timestamp (correct across DST)."""
+    return int((datetime(d.year, d.month, d.day) - timedelta(days=days_back)).timestamp())
+
+
+def period_stats(conn, pid, since, poll, price, device=""):
     """Runtime (relay on), energy and cost since a timestamp, plus per-day averages.
     Runtime adds the gap to the previous reading whenever the plug was on
     (capped, so time when the program was off is not counted)."""
-    w, p = dev_where(device)
+    w, p = where(pid, device)
     runtime, wh, days = conn.execute(f"""
         SELECT COALESCE(SUM(CASE WHEN on_state = 1 AND prev IS NOT NULL
                                  THEN MIN(ts - prev, ?) ELSE 0 END), 0),
                COALESCE(SUM(wh), 0),
                COUNT(DISTINCT date(ts, 'unixepoch', 'localtime'))
         FROM (SELECT ts, on_state, wh, LAG(ts) OVER (ORDER BY ts) AS prev
-              FROM readings WHERE ts >= ?{w})""", (poll * 3, since) + p).fetchone()
+              FROM readings WHERE ts >= ?{w})""", (poll * GAP_POLLS, since) + p).fetchone()
     d = max(days, 1)
     return {"runtime_s": int(runtime), "kwh": round(wh / 1000, 3),
             "eur": round(wh / 1000 * price, 2), "days_with_data": days,
@@ -445,76 +835,157 @@ def period_stats(conn, since, poll, price, device=""):
             "avg_eur": round(wh / 1000 * price / d, 2)}
 
 
-def measured_seconds(conn, since, poll, device=""):
+def measured_seconds(conn, pid, since, poll, device=""):
     """Seconds covered by readings since a timestamp (gaps > 3 polls don't count)."""
-    w, p = dev_where(device)
+    w, p = where(pid, device)
     return conn.execute(f"""
         SELECT COALESCE(SUM(MIN(ts - prev, ?)), 0)
         FROM (SELECT ts, LAG(ts) OVER (ORDER BY ts) AS prev FROM readings WHERE ts >= ?{w})
-        WHERE prev IS NOT NULL""", (poll * 3, since) + p).fetchone()[0]
+        WHERE prev IS NOT NULL""", (poll * GAP_POLLS, since) + p).fetchone()[0]
 
 
-# All-time per-device totals. Scanning the whole table takes seconds once it holds
-# a year of readings, so it is done once and then only the new rows are added.
+# All-time per-device totals of each plug. Scanning a year of readings takes seconds,
+# so it is done once and then only the new rows are added.
 _dev_lock = threading.Lock()
-_dev = {"upto": None, "agg": {}}   # device -> [runtime_s, wh, first_ts, last_ts]
+_dev = {}            # plug id -> {"upto": last ts included, "agg": {device: [runtime_s, wh, first, last]}}
+_cache_gen = 0       # bumped on every invalidation; stale results are not cached
+_summary_cache = {}  # (plug, device, price, poll, day0) -> (time, generation, totals)
 
 
-def invalidate_device_totals():
-    """Rebuild the per-device totals and the page totals on the next request
-    (after relabel / reset)."""
+def invalidate_energy(pid=None):
+    """Forget cached totals (after relabel / reset)."""
+    global _cache_gen
     with _dev_lock:
-        _dev["upto"] = None
-    _summary_cache.clear()
+        if pid is None:
+            _dev.clear()
+        else:
+            _dev.pop(pid, None)
+        _cache_gen += 1
+        _summary_cache.clear()
 
 
-def _device_agg(conn, poll):
-    """[(device, runtime_s, wh, first_ts, last_ts)], most recently used first."""
-    gap = poll * 3
+def _device_agg(conn, pid, poll):
+    """[(device, runtime_s, wh, first_ts, last_ts)] of one plug, most recently used first."""
+    gap = poll * GAP_POLLS
     with _dev_lock:
-        if _dev["upto"] is None:
+        c = _dev.get(pid)
+        if c is None:
             agg = {}
             for dev, rt, wh, first, last_ts in conn.execute("""
                 SELECT device,
                        SUM(CASE WHEN on_state = 1 AND prev IS NOT NULL THEN MIN(ts - prev, ?) ELSE 0 END),
                        SUM(wh), MIN(ts), MAX(ts)
                 FROM (SELECT device, ts, on_state, wh,
-                             LAG(ts) OVER (PARTITION BY device ORDER BY ts) AS prev FROM readings)
-                GROUP BY device""", (gap,)):
+                             LAG(ts) OVER (PARTITION BY device ORDER BY ts) AS prev
+                      FROM readings WHERE plug = ?)
+                GROUP BY device""", (gap, pid)):
                 agg[dev] = [rt or 0, wh or 0, first, last_ts]
-            _dev["agg"] = agg
-            _dev["upto"] = max((a[3] for a in agg.values()), default=-1)
+            c = _dev[pid] = {"agg": agg, "upto": max((a[3] for a in agg.values()), default=-1)}
         else:
             for dev, ts, on, wh in conn.execute(
-                    "SELECT device, ts, on_state, wh FROM readings WHERE ts > ? ORDER BY ts",
-                    (_dev["upto"],)):
-                a = _dev["agg"].get(dev)
+                    "SELECT device, ts, on_state, wh FROM readings WHERE plug = ? AND ts > ? ORDER BY ts",
+                    (pid, c["upto"])):
+                a = c["agg"].get(dev)
                 if a is None:
-                    _dev["agg"][dev] = [0, wh or 0, ts, ts]
+                    c["agg"][dev] = [0, wh or 0, ts, ts]
                 else:
                     if on == 1:
                         a[0] += min(ts - a[3], gap)
                     a[1] += wh or 0
                     a[3] = ts
-                _dev["upto"] = ts
-        rows = sorted(_dev["agg"].items(), key=lambda kv: kv[1][3], reverse=True)
+                c["upto"] = ts
+        rows = sorted(c["agg"].items(), key=lambda kv: kv[1][3], reverse=True)
     return [(dev, *a) for dev, a in rows]
 
 
-def device_totals(conn, poll, price, agg=None):
-    """One row per device label ever logged: runtime, kWh, cost, first and last day."""
+def device_totals(conn, pid, poll, price, agg=None):
+    """One row per device label ever logged on a plug: runtime, kWh, cost, first and last day."""
     return [{"device": dev, "runtime_s": int(rt), "kwh": round(wh / 1000, 3),
              "eur": round(wh / 1000 * price, 2),
              "first": datetime.fromtimestamp(first).strftime("%d.%m.%Y"),
              "last": datetime.fromtimestamp(last_ts).strftime("%d.%m.%Y")}
-            for dev, rt, wh, first, last_ts in (agg if agg is not None else _device_agg(conn, poll))]
+            for dev, rt, wh, first, last_ts in (agg if agg is not None else _device_agg(conn, pid, poll))]
 
 
-def chart_data(rng, date, price, device="", compare=True):
+def energy_summary(pid, price, live_w, poll, device=""):
+    """Totals for the page. `device` limits everything to one label ('' = all).
+    The database part is cached for SUMMARY_CACHE_S: the page asks every 3 s and
+    the 7/30-day queries take a second or more on a big database."""
+    now = datetime.now()
+    day0 = midnight(now)
+    key = (pid, device, price, poll, day0)
+    hit = _summary_cache.get(key)
+    if hit and time.time() - hit[0] < SUMMARY_CACHE_S and hit[1] == _cache_gen:
+        out = dict(hit[2])
+    else:
+        gen = _cache_gen
+        out = _energy_totals(pid, now, day0, price, poll, device)
+        with _dev_lock:
+            if gen == _cache_gen:          # nothing was reset/relabeled meanwhile
+                if len(_summary_cache) > 50:
+                    _summary_cache.clear()
+                _summary_cache[key] = (time.time(), gen, out)
+        out = dict(out)
+    out.update(now_eur_per_hour=round((live_w or 0) / 1000 * price, 3),
+               now_eur_per_day=round((live_w or 0) / 1000 * 24 * price, 2),
+               current_device=plug_state(pid)["device"])
+    return out
+
+
+def _energy_totals(pid, now, day0, price, poll, device):
+    mon0 = int(datetime(now.year, now.month, 1).timestamp())
+    w, p = where(pid, device)
+    conn = db()
+    try:
+        q = f"SELECT COALESCE(SUM(wh),0) FROM readings WHERE ts >= ?{w}"
+        today = conn.execute(q, (day0,) + p).fetchone()[0]
+        month = conn.execute(q, (mon0,) + p).fetchone()[0]
+        periods = {
+            "today": period_stats(conn, pid, day0, poll, price, device),
+            "d7": period_stats(conn, pid, midnight(now, 6), poll, price, device),
+            "d30": period_stats(conn, pid, midnight(now, 29), poll, price, device),
+        }
+        measured_s = measured_seconds(conn, pid, mon0, poll, device)
+        logged_today = measured_seconds(conn, pid, day0, poll)
+        agg = _device_agg(conn, pid, poll)
+    finally:
+        conn.close()
+    devices = device_totals(None, pid, poll, price, agg)
+    # All-time total from the per-device totals (no full table scan)
+    total = sum(r[2] for r in agg if not device or r[0] == device)
+
+    # Month projection: average draw over the time actually measured this month,
+    # applied to the whole month. Gaps (program off) are not counted as zero.
+    days_in_month = monthrange(now.year, now.month)[1]
+    proj_kwh = None
+    if measured_s >= 3600:
+        proj_kwh = month / 1000 / measured_s * days_in_month * 86400
+    # Share of today that was actually logged (program running and plug reachable)
+    secs_today = max(time.time() - day0, 1)
+    coverage = min(100, round(logged_today / secs_today * 100))
+
+    kwh = lambda wh: round(wh / 1000, 3)
+    eur = lambda wh: round(wh / 1000 * price, 2)
+    return {
+        "price_per_kwh": price,
+        "today_kwh": kwh(today), "today_eur": eur(today),
+        "month_kwh": kwh(month), "month_eur": eur(month),
+        "total_kwh": kwh(total), "total_eur": eur(total),
+        "projected_month_kwh": None if proj_kwh is None else round(proj_kwh, 1),
+        "projected_month_eur": None if proj_kwh is None else round(proj_kwh * price, 2),
+        "coverage_today_pct": coverage,
+        "measured_month_h": round(measured_s / 3600, 1),
+        "periods": periods,
+        "device": device, "devices": devices,
+    }
+
+
+def chart_data(pid, rng, date, price, device="", compare=True):
     """kWh per bucket like the Tuya app: day = 24 hours, week = Mon–Sun, month = 1..31.
     With compare, the previous day/week/month is included as `prev`."""
     d = datetime.strptime(date, "%Y-%m-%d") if date else datetime.now()
     d = datetime(d.year, d.month, d.day)
+    prev = None
     if compare:
         if rng == "day":
             pd = d - timedelta(days=1)
@@ -522,7 +993,7 @@ def chart_data(rng, date, price, device="", compare=True):
             pd = d - timedelta(days=7)
         else:
             pd = datetime(d.year, d.month, 1) - timedelta(days=1)
-        prev = chart_data(rng, pd.strftime("%Y-%m-%d"), price, device, compare=False)
+        prev = chart_data(pid, rng, pd.strftime("%Y-%m-%d"), price, device, compare=False)
         prev = {k: prev[k] for k in ("kwh", "title", "total_kwh", "total_eur")}
     if rng == "day":
         start, n = d, 24
@@ -542,267 +1013,219 @@ def chart_data(rng, date, price, device="", compare=True):
         key = "CAST(strftime('%d', ts, 'unixepoch', 'localtime') AS INTEGER) - 1"
         labels = list(range(1, n + 1))
         title = f"{start:%B %Y}"
-    w, p = dev_where(device)
+    w, p = where(pid, device)
     args = ((start.strftime("%Y-%m-%d"),) if rng == "week" else ()) + \
            (int(start.timestamp()), int(end.timestamp())) + p
     conn = db()
-    rows = conn.execute(f"SELECT {key} k, SUM(wh) FROM readings "
-                        f"WHERE ts >= ? AND ts < ?{w} GROUP BY k", args).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute(f"SELECT {key} k, SUM(wh) FROM readings "
+                            f"WHERE ts >= ? AND ts < ?{w} GROUP BY k", args).fetchall()
+    finally:
+        conn.close()
     wh = [0.0] * n
     for k, v in rows:
-        if 0 <= k < n:
-            wh[k] += v
+        if k is not None and 0 <= k < n:
+            wh[k] += v or 0
     total = sum(wh)
     return {"range": rng, "date": d.strftime("%Y-%m-%d"), "title": title,
             "labels": labels, "kwh": [round(x / 1000, 4) for x in wh],
             "total_kwh": round(total / 1000, 3), "total_eur": round(total / 1000 * price, 2),
-            "has_data": [x > 0 for x in wh], "prev": prev if compare else None}
+            "has_data": [x > 0 for x in wh], "prev": prev}
+
+
+def plug_name(pid):
+    return PLUGS[pid].name if pid in PLUGS else plug_state_name(pid)
+
+
+def plug_state_name(pid):
+    return state["plugs"].get(pid, {}).get("name") or f"Plug {pid}"
 
 
 def month_report(year, month, price, poll):
-    """Text summary of one calendar month for the Discord report."""
+    """Text summary of one calendar month (all plugs) for the monthly notification."""
     start = datetime(year, month, 1)
     end = datetime(year + (month == 12), month % 12 + 1, 1)
     conn = db()
-    rows = conn.execute("""
-        SELECT device, SUM(wh), SUM(CASE WHEN on_state = 1 AND prev IS NOT NULL
-                                         THEN MIN(ts - prev, ?) ELSE 0 END)
-        FROM (SELECT device, ts, on_state, wh,
-                     LAG(ts) OVER (PARTITION BY device ORDER BY ts) AS prev
-              FROM readings WHERE ts >= ? AND ts < ?)
-        GROUP BY device ORDER BY SUM(wh) DESC""",
-        (poll * 3, int(start.timestamp()), int(end.timestamp()))).fetchall()
-    busiest = conn.execute("""
-        SELECT date(ts, 'unixepoch', 'localtime') d, SUM(wh) FROM readings
-        WHERE ts >= ? AND ts < ? GROUP BY d ORDER BY SUM(wh) DESC LIMIT 1""",
-        (int(start.timestamp()), int(end.timestamp()))).fetchone()
-    conn.close()
+    try:
+        rows = conn.execute("""
+            SELECT plug, device, SUM(wh), SUM(CASE WHEN on_state = 1 AND prev IS NOT NULL
+                                                   THEN MIN(ts - prev, ?) ELSE 0 END)
+            FROM (SELECT plug, device, ts, on_state, wh,
+                         LAG(ts) OVER (PARTITION BY plug, device ORDER BY ts) AS prev
+                  FROM readings WHERE ts >= ? AND ts < ?)
+            GROUP BY plug, device ORDER BY SUM(wh) DESC""",
+            (poll * GAP_POLLS, int(start.timestamp()), int(end.timestamp()))).fetchall()
+        busiest = conn.execute("""
+            SELECT date(ts, 'unixepoch', 'localtime') d, SUM(wh) FROM readings
+            WHERE ts >= ? AND ts < ? GROUP BY d ORDER BY SUM(wh) DESC LIMIT 1""",
+            (int(start.timestamp()), int(end.timestamp()))).fetchone()
+    finally:
+        conn.close()
     if not rows:
         return None
-    wh = sum(r[1] for r in rows)
-    runtime = sum(r[2] for r in rows)
-    lines = [f"Report for {start:%B %Y}: {wh / 1000:.2f} kWh = {wh / 1000 * price:.2f} €, "
+    wh = sum(r[2] or 0 for r in rows)
+    runtime = sum(r[3] or 0 for r in rows)
+    eur = lambda x: f"{(x or 0) / 1000 * price:.2f} €"
+    lines = [f"Report for {start:%B %Y}: {wh / 1000:.2f} kWh = {eur(wh)}, "
              f"switched on for {runtime / 3600:.1f} h."]
     if busiest:
         bd = datetime.strptime(busiest[0], "%Y-%m-%d")
-        lines.append(f"Busiest day: {bd:%a %d.%m.} with {busiest[1] / 1000:.2f} kWh "
-                     f"({busiest[1] / 1000 * price:.2f} €).")
-    if len(rows) > 1:
+        lines.append(f"Busiest day: {bd:%a %d.%m.} with {busiest[1] / 1000:.2f} kWh ({eur(busiest[1])}).")
+    plugs = {}
+    for pid, dev, w, rt in rows:
+        t = plugs.setdefault(pid, [0, 0])
+        t[0] += w or 0
+        t[1] += rt or 0
+    if len(plugs) > 1:
+        lines.append("Per plug: " + ", ".join(
+            f"{plug_name(pid)} {w / 1000:.2f} kWh ({eur(w)}), on {rt / 3600:.1f} h"
+            for pid, (w, rt) in sorted(plugs.items(), key=lambda kv: -kv[1][0])))
+    if len(rows) > len(plugs):
         lines.append("Per device: " + ", ".join(
-            f"{r[0]} {r[1] / 1000:.2f} kWh ({r[1] / 1000 * price:.2f} €)" for r in rows))
+            f"{dev}{f' ({plug_name(pid)})' if len(plugs) > 1 else ''} "
+            f"{(w or 0) / 1000:.2f} kWh ({eur(w)})" for pid, dev, w, _ in rows))
     return "\n".join(lines)
 
 
-def monthly_checks():
-    """Budget alert and the monthly report. Called from the poll loop every few minutes."""
-    n = datetime.now()
+_report_tries = {}
+
+
+def monthly_checks(now=None):
+    """Budget alert (all plugs together) and the monthly report."""
+    n = now or datetime.now()
+    month_key = n.strftime("%Y-%m")
     price = state["price_per_kwh"]
-    poll = cfg.get("poll_seconds", 10)
+    poll = cfg["poll_seconds"]
     budget = state["alerts"].get("budget_eur") or 0
-    if budget > 0:
-        mon0 = int(datetime(n.year, n.month, 1).timestamp())
+    if budget > 0 and state.get("budget_alerted") != month_key:
         conn = db()
-        wh = conn.execute("SELECT COALESCE(SUM(wh), 0) FROM readings WHERE ts >= ?",
-                          (mon0,)).fetchone()[0]
-        conn.close()
+        try:
+            wh = conn.execute("SELECT COALESCE(SUM(wh), 0) FROM readings WHERE ts >= ?",
+                              (int(datetime(n.year, n.month, 1).timestamp()),)).fetchone()[0]
+        finally:
+            conn.close()
         cost = wh / 1000 * price
-        raise_alert(f"budget-{n:%Y-%m}", cost >= budget,
-                    f"This month's cost is {cost:.2f} €, over your budget of {budget:.2f} €")
-    this_month = n.strftime("%Y-%m")
-    if state["alerts"].get("monthly_report") and state.get("last_report") != this_month:
+        if cost >= budget:
+            with state_lock:
+                state["budget_alerted"] = month_key     # once per month, also across restarts
+                save_state()
+            alert_once(f"budget-{month_key}",
+                       f"This month's cost is {cost:.2f} €, over your budget of {budget:.2f} €")
+    if state["alerts"].get("monthly_report") and state.get("last_report") != month_key:
         prev_last_day = datetime(n.year, n.month, 1) - timedelta(days=1)
         text = month_report(prev_last_day.year, prev_last_day.month, price, poll)
-        with state_lock:
-            state["last_report"] = this_month     # once per month, even if there was no data
-            save_state()
-        if text:
-            log("monthly report sent")
-            threading.Thread(target=notify, args=(text,), daemon=True).start()
-
-
-def energy_summary(price, live_w, poll, device=""):
-    """Totals for the page. `device` limits everything to one label ('' = all).
-    The database part is cached for SUMMARY_CACHE_S: the page asks every 3 s and
-    the 7/30-day queries take a second or more on a big database."""
-    now = datetime.now()
-    day0 = int(datetime(now.year, now.month, now.day).timestamp())
-    key = (device, price, poll, day0)
-    hit = _summary_cache.get(key)
-    if hit and time.time() - hit[0] < SUMMARY_CACHE_S:
-        out = dict(hit[1])
-    else:
-        out = _energy_totals(now, day0, price, poll, device)
-        if len(_summary_cache) > 20:
-            _summary_cache.clear()
-        _summary_cache[key] = (time.time(), out)
-        out = dict(out)
-    out.update(now_eur_per_hour=round((live_w or 0) / 1000 * price, 3),
-               now_eur_per_day=round((live_w or 0) / 1000 * 24 * price, 2),
-               current_device=state["device"])
-    return out
-
-
-SUMMARY_CACHE_S = 30
-_summary_cache = {}   # (device, price, poll, day0) -> (time, totals)
-
-
-def _energy_totals(now, day0, price, poll, device):
-    conn = db()
-    mon0 = int(datetime(now.year, now.month, 1).timestamp())
-    w, p = dev_where(device)
-    q = f"SELECT COALESCE(SUM(wh),0), COUNT(*) FROM readings WHERE ts >= ?{w}"
-    today, n_today = conn.execute(q, (day0,) + p).fetchone()
-    month, _ = conn.execute(q, (mon0,) + p).fetchone()
-    periods = {
-        "today": period_stats(conn, day0, poll, price, device),
-        "d7": period_stats(conn, day0 - 6 * 86400, poll, price, device),
-        "d30": period_stats(conn, day0 - 29 * 86400, poll, price, device),
-    }
-    measured_s = measured_seconds(conn, mon0, poll, device)
-    agg = _device_agg(conn, poll)
-    devices = device_totals(conn, poll, price, agg)
-    conn.close()
-    # All-time total from the per-device totals (no full table scan)
-    total = sum(r[2] for r in agg if not device or r[0] == device)
-
-    # Month projection: average draw over the time actually measured this month,
-    # applied to the whole month. Gaps (program off) are not counted as zero.
-    days_in_month = monthrange(now.year, now.month)[1]
-    proj_kwh = None
-    if measured_s >= 3600:
-        proj_kwh = month / 1000 / measured_s * days_in_month * 86400
-    # Share of today that was actually logged (program running and plug reachable)
-    secs_today = max(time.time() - day0, 1)
-    coverage = min(100, round(n_today * poll / secs_today * 100))
-
-    kwh = lambda wh: round(wh / 1000, 3)
-    eur = lambda wh: round(wh / 1000 * price, 2)
-    return {
-        "price_per_kwh": price,
-        "today_kwh": kwh(today), "today_eur": eur(today),
-        "month_kwh": kwh(month), "month_eur": eur(month),
-        "total_kwh": kwh(total), "total_eur": eur(total),
-        "projected_month_kwh": None if proj_kwh is None else round(proj_kwh, 1),
-        "projected_month_eur": None if proj_kwh is None else round(proj_kwh * price, 2),
-        "coverage_today_pct": coverage,
-        "measured_month_h": round(measured_s / 3600, 1),
-        "periods": periods,
-        "device": device, "devices": devices,
-    }
+        err = notify(text) if text else None
+        tries = _report_tries.get(month_key, 0) + 1
+        _report_tries[month_key] = tries
+        # Retry a failed send on the next checks (every 5 min), for about an hour
+        if err is None or err == "no notification URL set" or tries >= 12:
+            with state_lock:
+                state["last_report"] = month_key
+                save_state()
+            if text:
+                log("monthly report " + ("sent" if err is None else f"not sent: {err}"))
 
 
 # --------------------------------------------------------------------------
-# Parsing raw data points into something readable
+# Background loops: one per plug, plus one for the monthly checks
 # --------------------------------------------------------------------------
 
-def parse(d):
-    def scaled(dp, scale):
-        v = d.get(dp)
-        return None if v is None else round(v / scale, 3)
-    fault = d.get(DP_FAULT) or 0
-    return {
-        "on": bool(d.get(DP_SWITCH, False)),
-        "power_w": scaled(DP_POWER, 10),
-        "voltage_v": scaled(DP_VOLTAGE, 10),
-        "current_a": scaled(DP_CURRENT, 1000),
-        "countdown_s": d.get(DP_COUNTDOWN, 0),
-        "faults": [name for i, name in enumerate(FAULT_BITS) if fault & (1 << i)],
-        "power_on": d.get(DP_POWER_ON),
-        "overcurrent": d.get(DP_OVERCURRENT),
-        "led": d.get(DP_LED),
-        "child_lock": d.get(DP_CHILD_LOCK),
-        "inching": decode_inching(d.get(DP_INCHING, "")),
-        "cycle": decode_cycle(d.get(DP_CYCLE, "")),
-        "random": decode_random(d.get(DP_RANDOM, "")),
-    }
-
-
-# --------------------------------------------------------------------------
-# Background loop
-# --------------------------------------------------------------------------
-
-def set_plug(on, reason=""):
+def poll_once(plug, now, elapsed_s):
+    """Read the plug, store the reading, update alerts."""
     try:
-        plug.set_dp(DP_SWITCH, bool(on))
-        log(f"plug -> {'ON' if on else 'OFF'} {reason}")
+        st = plug.read()
     except Exception as e:
-        log(f"set failed: {e}")
+        plug.last["fail_count"] += 1
+        plug.last.update(error=str(e) or e.__class__.__name__, ts=now)
+        fc = plug.last["fail_count"]
+        if fc == GAP_POLLS:
+            set_alert(f"offline-{plug.id}", True, f"{plug.name}: plug is not reachable")
+        if (fc == GAP_POLLS or fc % 30 == 0) and hasattr(plug.backend, "rediscover"):
+            try:
+                plug.backend.rediscover()
+            except Exception as e2:
+                log(f"{plug.name}: rediscover failed: {e2}")
+        return
+    if alert_active(f"offline-{plug.id}"):
+        set_alert(f"offline-{plug.id}", False)
+        alert_once(f"online-{plug.id}", f"{plug.name}: plug is reachable again")
+    plug.last.update(error=None, ts=now, fail_count=0)
+    # Database and alert problems are logged, not counted as the plug failing
+    try:
+        log_reading(plug.id, st, elapsed_s, plug_state(plug.id)["device"])
+    except Exception as e:
+        log(f"{plug.name}: saving reading failed: {e}")
+    try:
+        set_alert(f"fault-{plug.id}", bool(st["faults"]),
+                  f"{plug.name}: plug reports fault: " + ", ".join(st["faults"]))
+        limit = plug_state(plug.id).get("power_above_w") or 0
+        power = st["power_w"] or 0
+        if not limit or power < limit * POWER_CLEAR:
+            plug.power_alert = False
+            set_alert(f"power-{plug.id}", False)
+        elif power > limit and not plug.power_alert:
+            plug.power_alert = True
+            set_alert(f"power-{plug.id}", True,
+                      f"{plug.name}: power {power:.0f} W is above your limit of {limit:g} W")
+    except Exception as e:
+        log(f"{plug.name}: alert check failed: {e}")
 
 
-def loop(interval):
-    last_ts = time.time()
-    last_monthly = 0.0
-    fired = set()
-    while True:
-        now = time.time()
-        if now - last_monthly >= 300:     # every 5 minutes, whatever the poll interval
-            last_monthly = now
-            try:
-                monthly_checks()
-            except Exception as e:
-                log(f"monthly checks failed: {e}")
-        try:
-            dps = plug.get_dps()
-        except Exception as e:
-            dps = None
-            err = e
-        if dps is not None:
-            last["dps"].update(dps)
-            st = parse(last["dps"])
-            if last["fail_count"] >= 3:
-                log("plug reachable again")
-                threading.Thread(target=notify, args=("Plug is reachable again",), daemon=True).start()
-            last.update(error=None, ts=now, fail_count=0)
-            # Database and alert problems are logged, not counted as the plug failing
-            try:
-                # Cap the step so a sleep/hibernate gap is not counted as usage
-                log_reading(st, min(now - last_ts, interval * 3))
-            except Exception as e:
-                log(f"saving reading failed: {e}")
-            try:
-                raise_alert("offline", False, "")
-                raise_alert("fault", bool(st["faults"]),
-                            "Plug reports fault: " + ", ".join(st["faults"]))
-                limit = state["alerts"].get("power_above_w") or 0
-                power = st["power_w"] or 0
-                raise_alert("power", bool(limit) and power > limit,
-                            f"Power {power:.0f} W is above your limit of {limit:g} W")
-            except Exception as e:
-                log(f"alert check failed: {e}")
-        else:
-            last["fail_count"] += 1
-            last.update(error=str(err), ts=now)
-            if last["fail_count"] == 3:
-                raise_alert("offline", True, "Plug is not reachable")
-                if hasattr(plug, "rediscover"):
-                    try:
-                        ip = plug.rediscover()
-                        if ip:
-                            log(f"plug found at new IP {ip}, config.json updated")
-                    except Exception as e2:
-                        log(f"rediscover failed: {e2}")
-            if last["fail_count"] % 30 == 0 and hasattr(plug, "rediscover"):
-                try:
-                    plug.rediscover()
-                except Exception:
-                    pass
-        last_ts = now
-
+def run_schedules(plug, now=None):
+    """Fire the weekly schedules that are due. Minutes missed since the last check
+    (slow pass, rediscovery, DST jump) are caught up for up to 15 minutes; failed
+    switches are retried and alerted."""
+    cur = (now or datetime.now()).replace(second=0, microsecond=0)
+    if plug.sched_last is None or cur < plug.sched_last - timedelta(hours=2):
+        plug.sched_last = cur - timedelta(minutes=1)    # start / clock set back by hand
+    due = []
+    if cur > plug.sched_last:
         with state_lock:
-            n = datetime.now()
-            key_min = n.strftime("%Y-%m-%d %H:%M")
-            today = DAYS[(n.weekday() + 1) % 7]
-            for i, s in enumerate(state["schedules"]):
-                if not s.get("enabled", True) or today not in s["days"]:
-                    continue
-                if s["time"] == n.strftime("%H:%M") and (i, key_min) not in fired:
-                    fired.add((i, key_min))
-                    set_plug(s["action"] == "on", f"(schedule {s['time']})")
-            if len(fired) > 500:
-                fired.clear()
+            scheds = [dict(s) for s in plug_state(plug.id)["schedules"] if s.get("enabled", True)]
+        m = max(plug.sched_last + timedelta(minutes=1), cur - timedelta(minutes=SCHED_CATCHUP_MIN))
+        while m <= cur:
+            day, hm = DAYS[(m.weekday() + 1) % 7], f"{m:%H:%M}"
+            due += [(s, m, 0) for s in scheds if s["time"] == hm and day in s["days"]]
+            m += timedelta(minutes=1)
+        plug.sched_last = cur
+    todo, plug.sched_retry = plug.sched_retry + due, []
+    for s, m, tries in todo:
+        err = plug.switch(s["action"] == "on", f"(schedule {s['time']})")
+        if err is None:
+            continue
+        if tries + 1 < SCHED_TRIES:
+            plug.sched_retry.append((s, m, tries + 1))
+        else:
+            alert_once(f"sched-{plug.id}",
+                       f"{plug.name}: schedule {s['time']} (turn {s['action']}) failed: {err}")
 
-        time.sleep(interval)
+
+def poll_loop(plug, interval):
+    last_ts = time.time()
+    while True:
+        t0 = time.time()
+        # Never let one bad pass end the thread: log it and carry on
+        try:
+            # Cap the step so a sleep/hibernate gap is not counted as usage
+            poll_once(plug, t0, min(t0 - last_ts, interval * GAP_POLLS))
+        except Exception as e:
+            log(f"{plug.name}: poll failed: {e}")
+        last_ts = t0
+        try:
+            run_schedules(plug)
+        except Exception as e:
+            log(f"{plug.name}: schedules failed: {e}")
+        # Keep the real interval close to poll_seconds however long the plug took
+        time.sleep(max(0.5, interval - (time.time() - t0)))
+
+
+def housekeeping_loop():
+    while True:
+        try:
+            monthly_checks()
+        except Exception as e:
+            log(f"monthly checks failed: {e}")
+        time.sleep(300)
 
 
 # --------------------------------------------------------------------------
@@ -810,131 +1233,218 @@ def loop(interval):
 # --------------------------------------------------------------------------
 
 app = Flask(__name__)
+app.json.ensure_ascii = False
 
 
-def refresh_now():
-    try:
-        last["dps"].update(plug.get_dps())
-        last.update(error=None, ts=time.time())
-    except Exception as e:
-        last.update(error=str(e))
+@app.errorhandler(ApiError)
+def _api_error(e):
+    return jsonify(ok=False, error=str(e)), e.code
+
+
+def body():
+    b = request.get_json(silent=True)
+    if not isinstance(b, dict):
+        raise ApiError("send a JSON object")
+    return b
+
+
+def pick_plug(b=None):
+    """The plug a request is about: ?plug=ID or "plug" in the body; default the first."""
+    pid = request.args.get("plug") or (b or {}).get("plug") or next(iter(PLUGS))
+    pid = str(pid)
+    if pid not in PLUGS:
+        raise ApiError(f"unknown plug '{pid}'", 404)
+    return PLUGS[pid]
+
+
+def plug_error(e):
+    return jsonify(ok=False, error=f"plug did not respond: {e}"), 502
+
+
+@app.get("/api/plugs")
+def api_plugs():
+    return jsonify(plugs=[p.overview() for p in PLUGS.values()])
 
 
 @app.get("/api/status")
 def api_status():
-    st = parse(last["dps"]) if last["dps"] else None
+    plug = pick_plug()
+    st = plug.status()
     with state_lock:   # copy the state; the slow database part runs without the lock
-        schedules = [dict(s) for s in state["schedules"]]
-        alerts_cfg = dict(state["alerts"])
+        ps = plug_state(plug.id)
+        schedules = [dict(s) for s in ps["schedules"]]
+        alerts_cfg = dict(state["alerts"], power_above_w=ps["power_above_w"])
         price = state["price_per_kwh"]
-    energy = energy_summary(price, st["power_w"] if st and st["on"] else 0,
-                            cfg.get("poll_seconds", 10), request.args.get("device", ""))
-    return jsonify(status=st, error=last["error"], updated=last["ts"],
+    # The webhook / topic URL works as a password: never send it back
+    alerts_cfg["notify_url"] = mask_url(alerts_cfg.get("notify_url"))
+    energy = energy_summary(plug.id, price, st["power_w"] if st and st["on"] else 0,
+                            cfg["poll_seconds"], request.args.get("device", ""))
+    return jsonify(plug={"id": plug.id, "name": plug.name},
+                   plugs=[p.overview() for p in PLUGS.values()],
+                   status=st, error=plug.last["error"], updated=plug.last["ts"],
                    schedules=schedules, alerts_cfg=alerts_cfg, alerts=alerts_log[:10],
                    energy=energy)
 
 
 @app.post("/api/switch")
 def api_switch():
-    set_plug(request.json.get("on"), "(manual)")
-    refresh_now()
+    b = body()
+    plug = pick_plug(b)
+    if not isinstance(b.get("on"), bool):
+        raise ApiError('send {"on": true} or {"on": false}')
+    err = plug.switch(b["on"], "(manual)")
+    plug.refresh()
+    if err:
+        return plug_error(err)
     return jsonify(ok=True)
 
 
 @app.post("/api/device")
 def api_device():
-    """Write an on-plug setting. Body: {"setting": name, "value": ...}"""
-    b = request.json
-    name, v = b["setting"], b.get("value")
+    """Write an on-plug setting. Body: {"plug": id, "setting": name, "value": ...}"""
+    b = body()
+    plug = pick_plug(b)
+    name, v = b.get("setting"), b.get("value")
     if name == "countdown":
-        plug.set_dp(DP_COUNTDOWN, max(0, min(86400, int(v))))
+        dp, val = "countdown", check_int(v, 0, 86400, "countdown seconds")
     elif name == "power_on":
         if v not in POWER_ON_VALUES:
-            return jsonify(ok=False, error=f"value must be one of {POWER_ON_VALUES}"), 400
-        plug.set_dp(DP_POWER_ON, v)
+            raise ApiError(f"value must be one of {POWER_ON_VALUES}")
+        dp, val = "power_on", v
     elif name == "led":
         if v not in LED_VALUES:
-            return jsonify(ok=False, error=f"value must be one of {LED_VALUES}"), 400
-        plug.set_dp(DP_LED, v)
-    elif name == "child_lock":
-        plug.set_dp(DP_CHILD_LOCK, bool(v))
-    elif name == "overcurrent":
-        plug.set_dp(DP_OVERCURRENT, bool(v))
+            raise ApiError(f"value must be one of {LED_VALUES}")
+        dp, val = "led", v
+    elif name in ("child_lock", "overcurrent"):
+        if not isinstance(v, bool):
+            raise ApiError("value must be true or false")
+        dp, val = name, v
     elif name == "inching":
-        plug.set_dp(DP_INCHING, encode_inching(v["enabled"], max(1, min(65535, int(v["seconds"])))))
+        if not isinstance(v, dict):
+            raise ApiError('value must be {"enabled": bool, "seconds": n}')
+        dp, val = "inching", encode_inching(bool(v.get("enabled")),
+                                            check_int(v.get("seconds"), 1, 65535, "seconds"))
     elif name == "cycle":
-        plug.set_dp(DP_CYCLE, encode_cycle(v))
+        dp, val = "cycle", encode_cycle(clean_cycle(v))
     elif name == "random":
-        plug.set_dp(DP_RANDOM, encode_random(v))
+        dp, val = "random", encode_random(clean_random(v))
     else:
-        return jsonify(ok=False, error="unknown setting"), 400
+        raise ApiError("unknown setting")
+    try:
+        plug.set(dp, val)
+    except Exception as e:
+        log(f"{plug.name}: setting {name} failed: {e}")
+        return plug_error(e)
     time.sleep(0.5)
-    refresh_now()
+    plug.refresh()
     return jsonify(ok=True)
 
 
 @app.post("/api/schedules")
 def api_schedules():
-    body = request.json
+    """Add {"time","action","days"}, or {"delete": id} / {"toggle": id} (id or list index)."""
+    b = body()
+    plug = pick_plug(b)
     with state_lock:
-        if "delete" in body:
-            state["schedules"].pop(int(body["delete"]))
-        elif "toggle" in body:
-            s = state["schedules"][int(body["toggle"])]
-            s["enabled"] = not s.get("enabled", True)
+        scheds = plug_state(plug.id)["schedules"]
+        if "delete" in b or "toggle" in b:
+            ref = b.get("delete", b.get("toggle"))
+            idx = next((i for i, s in enumerate(scheds) if s["id"] == ref), None)
+            if idx is None and isinstance(ref, int) and not isinstance(ref, bool) and 0 <= ref < len(scheds):
+                idx = ref
+            if idx is None:
+                raise ApiError("no such schedule", 404)
+            if "delete" in b:
+                scheds.pop(idx)
+            else:
+                scheds[idx]["enabled"] = not scheds[idx].get("enabled", True)
         else:
-            state["schedules"].append({"time": body["time"], "action": body["action"],
-                                       "days": body["days"], "enabled": True})
-            state["schedules"].sort(key=lambda s: s["time"])
+            if len(scheds) >= 50:
+                raise ApiError("at most 50 schedules per plug")
+            s = clean_schedule({k: b.get(k) for k in ("time", "action", "days")})
+            scheds.append(s)
+            scheds.sort(key=lambda s: s["time"])
         save_state()
     return jsonify(ok=True)
 
 
 @app.post("/api/settings")
 def api_settings():
-    b = request.json
+    """Any subset of: price_per_kwh, notify_url, budget_eur, monthly_report (all plugs);
+    plug_name, device, power_above_w (the plug given by "plug")."""
+    b = body()
+    plug = pick_plug(b)
+    # Check everything first, so a bad field changes nothing
+    new = {}
+    if "price_per_kwh" in b:
+        new["price_per_kwh"] = check_num(b["price_per_kwh"], "price")
+    if "budget_eur" in b:
+        new["budget_eur"] = check_num(b["budget_eur"] or 0, "budget")
+    if "power_above_w" in b:
+        new["power_above_w"] = check_num(b["power_above_w"] or 0, "power limit")
+    if "monthly_report" in b:
+        new["monthly_report"] = bool(b["monthly_report"])
+    if "notify_url" in b:
+        url = str(b["notify_url"] or "").strip()
+        if URL_MASK not in url:     # the page shows the masked URL; sending it back keeps the saved one
+            if url and not re.match(r"^https?://[^\s/]+", url):
+                raise ApiError("notification URL must start with http:// or https://")
+            new["notify_url"] = url
+    if "device" in b:
+        new["device"] = check_name(b["device"], "device name")
+    if "plug_name" in b:
+        new["plug_name"] = check_name(b["plug_name"], "plug name", 30)
     with state_lock:
-        if "price_per_kwh" in b:
-            state["price_per_kwh"] = float(b["price_per_kwh"])
-        if "power_above_w" in b:
-            state["alerts"]["power_above_w"] = float(b["power_above_w"] or 0)
-        if "notify_url" in b:
-            state["alerts"]["notify_url"] = (b["notify_url"] or "").strip()
-        if "budget_eur" in b:
-            state["alerts"]["budget_eur"] = max(0.0, float(b["budget_eur"] or 0))
-        if "monthly_report" in b:
-            state["alerts"]["monthly_report"] = bool(b["monthly_report"])
-        if "device" in b:
-            name = " ".join(str(b["device"]).split())[:40]
-            if not name:
-                return jsonify(ok=False, error="device name is empty"), 400
-            if name != state["device"]:
-                log(f"connected device: {state['device']} -> {name}")
-            state["device"] = name
-        save_state()
+        old = copy.deepcopy(state)
+        ps = plug_state(plug.id)
+        for k in ("price_per_kwh",):
+            if k in new:
+                state[k] = new[k]
+        for k in ("budget_eur", "monthly_report", "notify_url"):
+            if k in new:
+                state["alerts"][k] = new[k]
+        if "power_above_w" in new:
+            ps["power_above_w"] = new["power_above_w"]
+        if "device" in new:
+            if new["device"] != ps["device"]:
+                log(f"{plug.name}: connected device: {ps['device']} -> {new['device']}")
+            ps["device"] = new["device"]
+        if "plug_name" in new:
+            if new["plug_name"] != plug.name:
+                log(f"plug {plug.id} renamed: {plug.name} -> {new['plug_name']}")
+            ps["name"] = new["plug_name"]
+        try:
+            save_state()
+        except OSError as e:
+            state.clear()
+            state.update(old)
+            raise ApiError(f"could not save settings: {e}", 500) from None
     return jsonify(ok=True)
 
 
 @app.post("/api/relabel")
 def api_relabel():
-    """Change the device label of every reading between two local times.
-    Body: {"from": "YYYY-MM-DDTHH:MM", "to": "YYYY-MM-DDTHH:MM", "device": name}"""
-    b = request.json
-    name = " ".join(str(b.get("device", "")).split())[:40]
+    """Change the device label of a plug's readings between two local times.
+    Body: {"plug": id, "from": "YYYY-MM-DDTHH:MM", "to": "YYYY-MM-DDTHH:MM", "device": name}"""
+    b = body()
+    plug = pick_plug(b)
     try:
-        t0 = datetime.strptime(b["from"], "%Y-%m-%dT%H:%M")
-        t1 = datetime.strptime(b["to"], "%Y-%m-%dT%H:%M")
-    except (KeyError, ValueError):
-        return jsonify(ok=False, error="from/to must be YYYY-MM-DDTHH:MM"), 400
-    if not name or t1 <= t0:
-        return jsonify(ok=False, error="need a device name and to > from"), 400
+        t0 = datetime.strptime(str(b.get("from")), "%Y-%m-%dT%H:%M")
+        t1 = datetime.strptime(str(b.get("to")), "%Y-%m-%dT%H:%M")
+    except ValueError:
+        raise ApiError("from/to must be YYYY-MM-DDTHH:MM") from None
+    name = check_name(b.get("device"), "device name")
+    if t1 <= t0:
+        raise ApiError("to must be after from")
     conn = db()
-    cur = conn.execute("UPDATE readings SET device = ? WHERE ts >= ? AND ts < ?",
-                       (name, int(t0.timestamp()), int(t1.timestamp())))
-    conn.commit()
-    conn.close()
-    invalidate_device_totals()
-    log(f"relabeled {cur.rowcount} readings {t0:%d.%m. %H:%M}–{t1:%d.%m. %H:%M} as {name}")
+    try:
+        cur = conn.execute("UPDATE readings SET device = ? WHERE plug = ? AND ts >= ? AND ts < ?",
+                           (name, plug.id, int(t0.timestamp()), int(t1.timestamp())))
+        conn.commit()
+    finally:
+        conn.close()
+    invalidate_energy(plug.id)
+    log(f"{plug.name}: relabeled {cur.rowcount} readings {t0:%d.%m. %H:%M}–{t1:%d.%m. %H:%M} as {name}")
     return jsonify(ok=True, changed=cur.rowcount)
 
 
@@ -942,7 +1452,7 @@ def api_relabel():
 def api_test_report():
     """Send last month's report now (or this month so far if last month is empty)."""
     n = datetime.now()
-    price, poll = state["price_per_kwh"], cfg.get("poll_seconds", 10)
+    price, poll = state["price_per_kwh"], cfg["poll_seconds"]
     pl = datetime(n.year, n.month, 1) - timedelta(days=1)
     text = month_report(pl.year, pl.month, price, poll) or month_report(n.year, n.month, price, poll)
     if not text:
@@ -953,17 +1463,20 @@ def api_test_report():
 
 @app.post("/api/reset")
 def api_reset():
-    """Delete every stored reading. Settings, schedules and the price stay."""
-    if request.json.get("confirm") != "RESET":
-        return jsonify(ok=False, error="send {\"confirm\": \"RESET\"}"), 400
+    """Delete every stored reading of one plug. Settings, schedules and the price stay."""
+    b = body()
+    plug = pick_plug(b)
+    if b.get("confirm") != "RESET":
+        raise ApiError('send {"confirm": "RESET"}')
     conn = db()
-    n = conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
-    conn.execute("DELETE FROM readings")
-    conn.commit()
-    conn.execute("VACUUM")
-    conn.close()
-    invalidate_device_totals()
-    log(f"energy log reset: {n} readings deleted")
+    try:
+        n = conn.execute("DELETE FROM readings WHERE plug = ?", (plug.id,)).rowcount
+        conn.commit()
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+    invalidate_energy(plug.id)
+    log(f"{plug.name}: energy log reset: {n} readings deleted")
     return jsonify(ok=True, deleted=n)
 
 
@@ -975,48 +1488,66 @@ def api_test_notify():
 
 @app.get("/api/info")
 def api_info():
+    plug = pick_plug()
+    c = plug.cfg
     return jsonify(
-        name=cfg.get("name", "Smart Plug"), product=cfg.get("product"),
-        device_id=cfg.get("device_id", "demo"), mac=cfg.get("mac"),
-        ip=cfg.get("ip", "demo"), protocol=cfg.get("version"),
-        model=cfg.get("model"), poll_seconds=cfg.get("poll_seconds", 10))
-
-
-def _csv_response(rows, header, filename):
-    import csv
-    import io
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(header)
-    w.writerows(rows)
-    return Response(buf.getvalue(), mimetype="text/csv",
-                    headers={"Content-Disposition": f"attachment; filename={filename}"})
+        id=plug.id, name=plug.name, product=c.get("product"),
+        device_id=c.get("device_id", "demo"), mac=c.get("mac"),
+        ip=c.get("ip", "demo"), protocol=c.get("version", None if DEMO else 3.5),
+        model=c.get("model"), poll_seconds=cfg["poll_seconds"])
 
 
 @app.get("/api/export/readings.csv")
 def export_readings():
-    """Every stored reading (one row per poll). ?device=NAME limits it to one label."""
-    w, p = dev_where(request.args.get("device", ""))
-    conn = db()
-    rows = conn.execute(f"""SELECT datetime(ts,'unixepoch','localtime'), device, on_state,
-                                   power_w, voltage_v, current_a, ROUND(wh, 5)
-                            FROM readings WHERE 1=1{w} ORDER BY ts""", p).fetchall()
-    conn.close()
-    return _csv_response(rows, ["time", "device", "on", "power_w", "voltage_v", "current_a",
-                                "energy_wh"],
-                         f"plug-readings-{datetime.now():%Y-%m-%d}.csv")
+    """Every stored reading (one row per poll), streamed so a big log needs little memory.
+    ?plug=ID limits it to one plug, ?device=NAME (with plug) to one label."""
+    pid, device = request.args.get("plug", ""), request.args.get("device", "")
+    if pid and pid not in PLUGS:
+        raise ApiError(f"unknown plug '{pid}'", 404)
+    sql, args = "", ()
+    if pid:
+        sql, args = where(pid, device)
+    names = {p.id: p.name for p in PLUGS.values()}
+
+    def rows():
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["time", "plug", "device", "on", "power_w", "voltage_v", "current_a", "energy_wh"])
+        conn = db()
+        try:
+            cur = conn.execute(f"""SELECT datetime(ts,'unixepoch','localtime'), plug, device, on_state,
+                                          power_w, voltage_v, current_a, ROUND(wh, 5)
+                                   FROM readings WHERE 1=1{sql} ORDER BY ts, plug""", args)
+            while True:
+                chunk = cur.fetchmany(2000)
+                if not chunk:
+                    break
+                w.writerows((r[0], names.get(r[1], r[1])) + r[2:] for r in chunk)
+                yield buf.getvalue()
+                buf.seek(0)
+                buf.truncate()
+        finally:
+            conn.close()
+        yield buf.getvalue()
+
+    label = "-".join(x for x in (names.get(pid, "") if pid else "", device) if x)
+    label = re.sub(r"[^A-Za-z0-9_-]+", "_", label).strip("_")
+    filename = f"plug-readings{'-' + label if label else ''}-{datetime.now():%Y-%m-%d}.csv"
+    return Response(stream_with_context(rows()), mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
 @app.get("/api/chart")
 def api_chart():
+    plug = pick_plug()
     rng = request.args.get("range", "day")
     if rng not in ("day", "week", "month"):
-        return jsonify(error="range must be day, week or month"), 400
+        raise ApiError("range must be day, week or month")
     try:
-        return jsonify(chart_data(rng, request.args.get("date"), state["price_per_kwh"],
+        return jsonify(chart_data(plug.id, rng, request.args.get("date"), state["price_per_kwh"],
                                   request.args.get("device", "")))
     except ValueError:
-        return jsonify(error="date must be YYYY-MM-DD"), 400
+        raise ApiError("date must be YYYY-MM-DD") from None
 
 
 @app.get("/")
@@ -1027,32 +1558,68 @@ def index():
 
 # --------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    if DEMO:
-        plug = DemoPlug()
-        cfg = {"poll_seconds": 2, "port": 8081}
-        DB_PATH = os.path.join(DATA, "demo_energy.db")
-        STATE_PATH = os.path.join(DATA, "demo_state.json")
-        log("DEMO MODE: simulated plug (separate demo_* data files)")
-    else:
-        if not os.path.exists(CONFIG_PATH):
-            sys.exit("config.json missing. Copy config.example.json and fill it in.")
-        with open(CONFIG_PATH) as f:
-            cfg = json.load(f)
-        apply_dps(cfg.get("dps"))
-        plug = TuyaPlug(cfg)
-    load_state(cfg)
+def init(raw_cfg=None, demo=False, data_dir=None):
+    """Load config, plugs, state and the database. Separate from main() for the tests."""
+    global DATA, CONFIG_PATH, STATE_PATH, DB_PATH, DEMO, _db_ready
+    DEMO = demo
+    DATA = data_dir or DATA
+    CONFIG_PATH = os.path.join(DATA, "config.json")
+    STATE_PATH = os.path.join(DATA, "demo_state.json" if demo else "state.json")
+    DB_PATH = os.path.join(DATA, "demo_energy.db" if demo else "energy.db")
+    if raw_cfg is None:
+        if demo:
+            raw_cfg = DEMO_CONFIG
+        else:
+            if not os.path.exists(CONFIG_PATH):
+                raise ValueError("config.json missing. Copy config.example.json and fill it in.")
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                raw_cfg = json.load(f)
+    cfg.clear()
+    cfg.update(poll_seconds=int(raw_cfg.get("poll_seconds", DEFAULT_POLL)),
+               port=int(raw_cfg.get("port", 8080)),
+               title=raw_cfg.get("title") or ("Smart Plug" if "plugs" in raw_cfg
+                                              else raw_cfg.get("name") or "Smart Plug"))
+    if cfg["poll_seconds"] < 1:
+        raise ValueError("config.json: poll_seconds must be at least 1")
+    PLUGS.clear()
+    for pc in plug_configs(raw_cfg, demo):
+        PLUGS[pc["id"]] = Plug(pc, demo)
+    with alerts_lock:
+        _alerts.clear()
+        alerts_log.clear()
+    _db_ready = False
+    invalidate_energy()
+    load_state(raw_cfg)
+    db().close()          # create / upgrade the database now, not on the first request
 
-    def warm_device_totals():
+
+def start_threads():
+    for plug in PLUGS.values():
+        threading.Thread(target=poll_loop, args=(plug, cfg["poll_seconds"]), daemon=True,
+                         name=f"poll-{plug.id}").start()
+    threading.Thread(target=housekeeping_loop, daemon=True, name="housekeeping").start()
+
+    def warm():
         # The first full scan of a big database takes a few seconds: do it now,
         # not on the first page load
         conn = db()
         try:
-            device_totals(conn, cfg.get("poll_seconds", 10), state["price_per_kwh"])
+            for pid in PLUGS:
+                _device_agg(conn, pid, cfg["poll_seconds"])
         finally:
             conn.close()
-    threading.Thread(target=warm_device_totals, daemon=True).start()
-    threading.Thread(target=loop, args=(cfg.get("poll_seconds", 10),), daemon=True).start()
-    port = cfg.get("port", 8080)
-    log(f"listening on port {port}, plug at {cfg.get('ip', 'demo')}")
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    threading.Thread(target=warm, daemon=True, name="warm-cache").start()
+
+
+if __name__ == "__main__":
+    try:
+        init(demo=DEMO)
+    except (ValueError, OSError, json.JSONDecodeError) as e:
+        sys.exit(str(e))
+    if DEMO:
+        log("DEMO MODE: simulated plugs (separate demo_* data files)")
+    start_threads()
+    for p in PLUGS.values():
+        log(f"plug {p.id} '{p.name}' at {p.cfg.get('ip', 'demo')}")
+    log(f"listening on port {cfg['port']}")
+    app.run(host="0.0.0.0", port=cfg["port"], debug=False, use_reloader=False, threaded=True)

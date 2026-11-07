@@ -13,3 +13,5 @@ demo_state.json
 __pycache__/
 *.pyc
 *.tmp
+*.db-wal
+*.db-shm
