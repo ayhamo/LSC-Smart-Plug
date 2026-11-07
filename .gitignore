@@ -12,3 +12,4 @@ demo_state.json
 # python
 __pycache__/
 *.pyc
+*.tmp

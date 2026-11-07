@@ -10,7 +10,7 @@ if errorlevel 1 (
 )
 
 if not exist config.json (
-  echo config.json is missing. See HOW_TO_RUN.md.
+  echo config.json is missing. See README.md (Quick start).
   pause
   exit /b 1
 )

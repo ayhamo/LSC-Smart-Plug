@@ -2,7 +2,7 @@
   "device_id": "PASTE_FROM_TINYTUYA_WIZARD",
   "local_key": "PASTE_FROM_TINYTUYA_WIZARD",
   "ip": "192.168.1.50",
-  "version": 3.3,
+  "version": 3.5,
   "poll_seconds": 5,
   "port": 8080,
   "dps": {

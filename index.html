@@ -264,6 +264,8 @@ for (const id of ["cy_days","rn_days","sc_days"])
 const pickDays = id => [...document.querySelectorAll(`#${id} input:checked`)].map(i => i.value);
 const dayText = days => days.length === 7 ? "every day" : DAYS.filter(d => days.includes(d)).join(" ");
 const $ = id => document.getElementById(id);
+// Escape text before putting it into innerHTML (device names can contain " < & …)
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
 
 let S = null, editing = false;
 document.addEventListener("focusin", e => { if (e.target.matches("input")) editing = true; });
@@ -312,7 +314,7 @@ async function toggleInfo() {
   const i = await (await fetch("/api/info")).json();
   const rows = [["Name", i.name], ["Product", i.product], ["Model", i.model], ["Virtual ID", i.device_id],
                 ["MAC", i.mac], ["IP", i.ip], ["Protocol", i.protocol], ["Reading every", i.poll_seconds + " s"]];
-  $("infotab").innerHTML = rows.filter(r => r[1] != null).map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join("");
+  $("infotab").innerHTML = rows.filter(r => r[1] != null).map(r => `<tr><td>${r[0]}</td><td>${esc(r[1])}</td></tr>`).join("");
 }
 async function testNotify(b) {
   b.disabled = true; $("testres").textContent = "sending…";
@@ -377,15 +379,15 @@ async function saveDevice() {
 function renderDevices(e) {
   const names = e.devices.map(d => d.device);
   if (!names.includes(e.current_device)) names.unshift(e.current_device);
-  $("devlist").innerHTML = names.map(n => `<option value="${n}">`).join("");
+  $("devlist").innerHTML = names.map(n => `<option value="${esc(n)}">`).join("");
   const sel = $("devview");
   if (sel.options.length !== names.length + 1 || names.some((n, i) => sel.options[i+1].value !== n)) {
-    sel.innerHTML = `<option value="">All devices</option>` + names.map(n => `<option value="${n}">${n}</option>`).join("");
+    sel.innerHTML = `<option value="">All devices</option>` + names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
   }
   if (!names.includes(VIEW)) VIEW = "";
   sel.value = VIEW;
   if (!editing) $("device").value = e.current_device;
-  $("devtab").innerHTML = e.devices.map(d => `<tr><td>${d.device}${d.device === e.current_device ? ' <span class="tag">now</span>' : ""}</td><td>${hm(d.runtime_s)}</td><td>${d.kwh.toFixed(2)} kWh</td><td>${eur(d.eur)}</td><td class="muted">${d.first === d.last ? d.first : d.first + " – " + d.last}</td></tr>`).join("")
+  $("devtab").innerHTML = e.devices.map(d => `<tr><td>${esc(d.device)}${d.device === e.current_device ? ' <span class="tag">now</span>' : ""}</td><td>${hm(d.runtime_s)}</td><td>${d.kwh.toFixed(2)} kWh</td><td>${eur(d.eur)}</td><td class="muted">${d.first === d.last ? d.first : d.first + " – " + d.last}</td></tr>`).join("")
     || `<tr><td colspan="5" class="muted">Nothing logged yet.</td></tr>`;
   $("exp_dev").style.display = VIEW ? "" : "none";
   if (VIEW) { $("exp_dev").href = "/api/export/readings.csv?device=" + encodeURIComponent(VIEW); $("exp_dev_name").textContent = VIEW; }
@@ -528,7 +530,7 @@ async function refresh(force) {
   }
   charts(e);
   renderList($("slist"), d.schedules, "schedules", s => `<b>${s.time}</b> turn ${s.action} <span class="muted">(${dayText(s.days)})</span>`);
-  $("al_list").innerHTML = d.alerts.map(a => `<li><span class="t">${a.msg}</span><span class="muted">${new Date(a.ts*1000).toLocaleString()}</span></li>`).join("") || `<li class="muted">No alerts.</li>`;
+  $("al_list").innerHTML = d.alerts.map(a => `<li><span class="t">${esc(a.msg)}</span><span class="muted">${new Date(a.ts*1000).toLocaleString()}</span></li>`).join("") || `<li class="muted">No alerts.</li>`;
 }
 refresh(true); setInterval(refresh, 3000);
 </script>

@@ -24,7 +24,7 @@ services:
     # ports:
     #   - "8085:8080"
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/api/status"]
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/api/info"]
       interval: 600s
       timeout: 5s
       retries: 3

@@ -1,4 +1,4 @@
-FROM python:3.13-alpine
+FROM python:3.14-alpine
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -14,7 +14,7 @@ COPY requirements.txt .
 # Install deps, then remove pip itself (not needed at runtime)
 RUN pip install -r requirements.txt \
  && pip uninstall -y pip \
- && rm -rf /root/.cache /usr/local/lib/python3.13/ensurepip
+ && rm -rf /root/.cache /usr/local/lib/python3*/ensurepip
 
 COPY plug_server.py index.html ./
 

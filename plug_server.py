@@ -51,6 +51,42 @@ DP_LED, DP_CHILD_LOCK = "40", "41"
 DP_CYCLE, DP_RANDOM, DP_INCHING = "42", "43", "44"
 ENERGY_DPS = [int(DP_CURRENT), int(DP_POWER), int(DP_VOLTAGE)]
 
+# Names allowed in config.json "dps" -> the constant they override
+DP_NAMES = {"switch": "DP_SWITCH", "countdown": "DP_COUNTDOWN", "current": "DP_CURRENT",
+            "power": "DP_POWER", "voltage": "DP_VOLTAGE", "fault": "DP_FAULT",
+            "power_on": "DP_POWER_ON", "overcurrent": "DP_OVERCURRENT", "led": "DP_LED",
+            "child_lock": "DP_CHILD_LOCK", "cycle": "DP_CYCLE", "random": "DP_RANDOM",
+            "inching": "DP_INCHING"}
+
+
+def apply_dps(overrides):
+    """Use the data point numbers from config.json "dps" instead of the defaults."""
+    global ENERGY_DPS
+    g = globals()
+    for name, num in (overrides or {}).items():
+        if name not in DP_NAMES:
+            log(f"config.json: unknown dps entry '{name}' ignored "
+                f"(known: {', '.join(DP_NAMES)})")
+            continue
+        g[DP_NAMES[name]] = str(int(num))
+    ENERGY_DPS = [int(DP_CURRENT), int(DP_POWER), int(DP_VOLTAGE)]
+
+
+def write_json(path, obj):
+    """Write a JSON file so a crash mid-write never leaves it half written."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        # The file itself is a bind mount (can't be replaced): write it in place
+        os.remove(tmp)
+        with open(path, "w") as f:
+            json.dump(obj, f, indent=2)
+
 POWER_ON_VALUES = ["off", "on", "memory"]
 LED_VALUES = ["relay", "pos", "none", "on"]   # verified on the device
 FAULT_BITS = ["overcurrent", "overvoltage", "overpower",
@@ -256,8 +292,7 @@ class TuyaPlug:
             with open(CONFIG_PATH) as f:
                 disk = json.load(f)
             disk["ip"] = ip
-            with open(CONFIG_PATH, "w") as f:
-                json.dump(disk, f, indent=2)
+            write_json(CONFIG_PATH, disk)
             return ip
         return None
 
@@ -311,8 +346,7 @@ def load_state(cfg):
 
 
 def save_state():
-    with open(STATE_PATH, "w") as f:
-        json.dump(state, f, indent=2)
+    write_json(STATE_PATH, state)
 
 
 def raise_alert(key, active, message):
@@ -355,20 +389,25 @@ def notify(message):
 # --------------------------------------------------------------------------
 
 _db_ready = False
+_db_init_lock = threading.Lock()
 
 
 def db():
     global _db_ready
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     if not _db_ready:
-        conn.execute("""CREATE TABLE IF NOT EXISTS readings (
-            ts INTEGER PRIMARY KEY, on_state INTEGER, power_w REAL,
-            voltage_v REAL, current_a REAL, wh REAL, device TEXT NOT NULL DEFAULT 'AC')""")
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(readings)")]
-        if "device" not in cols:   # database from before the device label existed
-            conn.execute("ALTER TABLE readings ADD COLUMN device TEXT NOT NULL DEFAULT 'AC'")
-            conn.commit()
-        _db_ready = True
+        with _db_init_lock:
+            if not _db_ready:
+                # WAL: page queries (readers) no longer block the poll loop (writer)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("""CREATE TABLE IF NOT EXISTS readings (
+                    ts INTEGER PRIMARY KEY, on_state INTEGER, power_w REAL,
+                    voltage_v REAL, current_a REAL, wh REAL, device TEXT NOT NULL DEFAULT 'AC')""")
+                cols = [r[1] for r in conn.execute("PRAGMA table_info(readings)")]
+                if "device" not in cols:   # database from before the device label existed
+                    conn.execute("ALTER TABLE readings ADD COLUMN device TEXT NOT NULL DEFAULT 'AC'")
+                conn.commit()
+                _db_ready = True
     return conn
 
 
@@ -415,19 +454,60 @@ def measured_seconds(conn, since, poll, device=""):
         WHERE prev IS NOT NULL""", (poll * 3, since) + p).fetchone()[0]
 
 
-def device_totals(conn, poll, price):
+# All-time per-device totals. Scanning the whole table takes seconds once it holds
+# a year of readings, so it is done once and then only the new rows are added.
+_dev_lock = threading.Lock()
+_dev = {"upto": None, "agg": {}}   # device -> [runtime_s, wh, first_ts, last_ts]
+
+
+def invalidate_device_totals():
+    """Rebuild the per-device totals and the page totals on the next request
+    (after relabel / reset)."""
+    with _dev_lock:
+        _dev["upto"] = None
+    _summary_cache.clear()
+
+
+def _device_agg(conn, poll):
+    """[(device, runtime_s, wh, first_ts, last_ts)], most recently used first."""
+    gap = poll * 3
+    with _dev_lock:
+        if _dev["upto"] is None:
+            agg = {}
+            for dev, rt, wh, first, last_ts in conn.execute("""
+                SELECT device,
+                       SUM(CASE WHEN on_state = 1 AND prev IS NOT NULL THEN MIN(ts - prev, ?) ELSE 0 END),
+                       SUM(wh), MIN(ts), MAX(ts)
+                FROM (SELECT device, ts, on_state, wh,
+                             LAG(ts) OVER (PARTITION BY device ORDER BY ts) AS prev FROM readings)
+                GROUP BY device""", (gap,)):
+                agg[dev] = [rt or 0, wh or 0, first, last_ts]
+            _dev["agg"] = agg
+            _dev["upto"] = max((a[3] for a in agg.values()), default=-1)
+        else:
+            for dev, ts, on, wh in conn.execute(
+                    "SELECT device, ts, on_state, wh FROM readings WHERE ts > ? ORDER BY ts",
+                    (_dev["upto"],)):
+                a = _dev["agg"].get(dev)
+                if a is None:
+                    _dev["agg"][dev] = [0, wh or 0, ts, ts]
+                else:
+                    if on == 1:
+                        a[0] += min(ts - a[3], gap)
+                    a[1] += wh or 0
+                    a[3] = ts
+                _dev["upto"] = ts
+        rows = sorted(_dev["agg"].items(), key=lambda kv: kv[1][3], reverse=True)
+    return [(dev, *a) for dev, a in rows]
+
+
+def device_totals(conn, poll, price, agg=None):
     """One row per device label ever logged: runtime, kWh, cost, first and last day."""
-    rows = conn.execute("""
-        SELECT device,
-               SUM(CASE WHEN on_state = 1 AND prev IS NOT NULL THEN MIN(ts - prev, ?) ELSE 0 END),
-               SUM(wh), MIN(ts), MAX(ts)
-        FROM (SELECT device, ts, on_state, wh,
-                     LAG(ts) OVER (PARTITION BY device ORDER BY ts) AS prev FROM readings)
-        GROUP BY device ORDER BY MAX(ts) DESC""", (poll * 3,)).fetchall()
-    return [{"device": r[0], "runtime_s": int(r[1] or 0), "kwh": round((r[2] or 0) / 1000, 3),
-             "eur": round((r[2] or 0) / 1000 * price, 2),
-             "first": datetime.fromtimestamp(r[3]).strftime("%d.%m.%Y"),
-             "last": datetime.fromtimestamp(r[4]).strftime("%d.%m.%Y")} for r in rows]
+    return [{"device": dev, "runtime_s": int(rt), "kwh": round(wh / 1000, 3),
+             "eur": round(wh / 1000 * price, 2),
+             "first": datetime.fromtimestamp(first).strftime("%d.%m.%Y"),
+             "last": datetime.fromtimestamp(last_ts).strftime("%d.%m.%Y")}
+            for dev, rt, wh, first, last_ts in (agg if agg is not None else _device_agg(conn, poll))]
 
 
 def chart_data(rng, date, price, device="", compare=True):
@@ -542,24 +622,49 @@ def monthly_checks():
 
 
 def energy_summary(price, live_w, poll, device=""):
-    """Totals for the page. `device` limits everything to one label ('' = all)."""
-    conn = db()
+    """Totals for the page. `device` limits everything to one label ('' = all).
+    The database part is cached for SUMMARY_CACHE_S: the page asks every 3 s and
+    the 7/30-day queries take a second or more on a big database."""
     now = datetime.now()
     day0 = int(datetime(now.year, now.month, now.day).timestamp())
+    key = (device, price, poll, day0)
+    hit = _summary_cache.get(key)
+    if hit and time.time() - hit[0] < SUMMARY_CACHE_S:
+        out = dict(hit[1])
+    else:
+        out = _energy_totals(now, day0, price, poll, device)
+        if len(_summary_cache) > 20:
+            _summary_cache.clear()
+        _summary_cache[key] = (time.time(), out)
+        out = dict(out)
+    out.update(now_eur_per_hour=round((live_w or 0) / 1000 * price, 3),
+               now_eur_per_day=round((live_w or 0) / 1000 * 24 * price, 2),
+               current_device=state["device"])
+    return out
+
+
+SUMMARY_CACHE_S = 30
+_summary_cache = {}   # (device, price, poll, day0) -> (time, totals)
+
+
+def _energy_totals(now, day0, price, poll, device):
+    conn = db()
     mon0 = int(datetime(now.year, now.month, 1).timestamp())
     w, p = dev_where(device)
     q = f"SELECT COALESCE(SUM(wh),0), COUNT(*) FROM readings WHERE ts >= ?{w}"
     today, n_today = conn.execute(q, (day0,) + p).fetchone()
     month, _ = conn.execute(q, (mon0,) + p).fetchone()
-    total = conn.execute(q, (0,) + p).fetchone()[0]
     periods = {
         "today": period_stats(conn, day0, poll, price, device),
         "d7": period_stats(conn, day0 - 6 * 86400, poll, price, device),
         "d30": period_stats(conn, day0 - 29 * 86400, poll, price, device),
     }
     measured_s = measured_seconds(conn, mon0, poll, device)
-    devices = device_totals(conn, poll, price)
+    agg = _device_agg(conn, poll)
+    devices = device_totals(conn, poll, price, agg)
     conn.close()
+    # All-time total from the per-device totals (no full table scan)
+    total = sum(r[2] for r in agg if not device or r[0] == device)
 
     # Month projection: average draw over the time actually measured this month,
     # applied to the whole month. Gaps (program off) are not counted as zero.
@@ -578,14 +683,12 @@ def energy_summary(price, live_w, poll, device=""):
         "today_kwh": kwh(today), "today_eur": eur(today),
         "month_kwh": kwh(month), "month_eur": eur(month),
         "total_kwh": kwh(total), "total_eur": eur(total),
-        "now_eur_per_hour": round((live_w or 0) / 1000 * price, 3),
-        "now_eur_per_day": round((live_w or 0) / 1000 * 24 * price, 2),
         "projected_month_kwh": None if proj_kwh is None else round(proj_kwh, 1),
         "projected_month_eur": None if proj_kwh is None else round(proj_kwh * price, 2),
         "coverage_today_pct": coverage,
         "measured_month_h": round(measured_s / 3600, 1),
         "periods": periods,
-        "device": device, "current_device": state["device"], "devices": devices,
+        "device": device, "devices": devices,
     }
 
 
@@ -629,35 +732,47 @@ def set_plug(on, reason=""):
 
 def loop(interval):
     last_ts = time.time()
+    last_monthly = 0.0
     fired = set()
-    tick = 0
     while True:
         now = time.time()
-        tick += 1
-        if tick % max(1, 300 // interval) == 1:     # about every 5 minutes
+        if now - last_monthly >= 300:     # every 5 minutes, whatever the poll interval
+            last_monthly = now
             try:
                 monthly_checks()
             except Exception as e:
                 log(f"monthly checks failed: {e}")
         try:
             dps = plug.get_dps()
+        except Exception as e:
+            dps = None
+            err = e
+        if dps is not None:
             last["dps"].update(dps)
             st = parse(last["dps"])
-            # Cap the step so a sleep/hibernate gap is not counted as usage
-            log_reading(st, min(now - last_ts, interval * 3))
             if last["fail_count"] >= 3:
                 log("plug reachable again")
                 threading.Thread(target=notify, args=("Plug is reachable again",), daemon=True).start()
             last.update(error=None, ts=now, fail_count=0)
-            raise_alert("offline", False, "")
-            raise_alert("fault", bool(st["faults"]),
-                        "Plug reports fault: " + ", ".join(st["faults"]))
-            limit = state["alerts"].get("power_above_w") or 0
-            raise_alert("power", bool(limit) and (st["power_w"] or 0) > limit,
-                        f"Power {st['power_w']:.0f} W is above your limit of {limit} W")
-        except Exception as e:
+            # Database and alert problems are logged, not counted as the plug failing
+            try:
+                # Cap the step so a sleep/hibernate gap is not counted as usage
+                log_reading(st, min(now - last_ts, interval * 3))
+            except Exception as e:
+                log(f"saving reading failed: {e}")
+            try:
+                raise_alert("offline", False, "")
+                raise_alert("fault", bool(st["faults"]),
+                            "Plug reports fault: " + ", ".join(st["faults"]))
+                limit = state["alerts"].get("power_above_w") or 0
+                power = st["power_w"] or 0
+                raise_alert("power", bool(limit) and power > limit,
+                            f"Power {power:.0f} W is above your limit of {limit:g} W")
+            except Exception as e:
+                log(f"alert check failed: {e}")
+        else:
             last["fail_count"] += 1
-            last.update(error=str(e), ts=now)
+            last.update(error=str(err), ts=now)
             if last["fail_count"] == 3:
                 raise_alert("offline", True, "Plug is not reachable")
                 if hasattr(plug, "rediscover"):
@@ -708,15 +823,15 @@ def refresh_now():
 @app.get("/api/status")
 def api_status():
     st = parse(last["dps"]) if last["dps"] else None
-    with state_lock:
-        return jsonify(
-            status=st, error=last["error"], updated=last["ts"],
-            schedules=state["schedules"], alerts_cfg=state["alerts"],
-            alerts=alerts_log[:10],
-            energy=energy_summary(state["price_per_kwh"],
-                                  st["power_w"] if st and st["on"] else 0,
-                                  cfg.get("poll_seconds", 10),
-                                  request.args.get("device", "")))
+    with state_lock:   # copy the state; the slow database part runs without the lock
+        schedules = [dict(s) for s in state["schedules"]]
+        alerts_cfg = dict(state["alerts"])
+        price = state["price_per_kwh"]
+    energy = energy_summary(price, st["power_w"] if st and st["on"] else 0,
+                            cfg.get("poll_seconds", 10), request.args.get("device", ""))
+    return jsonify(status=st, error=last["error"], updated=last["ts"],
+                   schedules=schedules, alerts_cfg=alerts_cfg, alerts=alerts_log[:10],
+                   energy=energy)
 
 
 @app.post("/api/switch")
@@ -734,10 +849,12 @@ def api_device():
     if name == "countdown":
         plug.set_dp(DP_COUNTDOWN, max(0, min(86400, int(v))))
     elif name == "power_on":
-        assert v in POWER_ON_VALUES
+        if v not in POWER_ON_VALUES:
+            return jsonify(ok=False, error=f"value must be one of {POWER_ON_VALUES}"), 400
         plug.set_dp(DP_POWER_ON, v)
     elif name == "led":
-        assert v in LED_VALUES
+        if v not in LED_VALUES:
+            return jsonify(ok=False, error=f"value must be one of {LED_VALUES}"), 400
         plug.set_dp(DP_LED, v)
     elif name == "child_lock":
         plug.set_dp(DP_CHILD_LOCK, bool(v))
@@ -816,6 +933,7 @@ def api_relabel():
                        (name, int(t0.timestamp()), int(t1.timestamp())))
     conn.commit()
     conn.close()
+    invalidate_device_totals()
     log(f"relabeled {cur.rowcount} readings {t0:%d.%m. %H:%M}–{t1:%d.%m. %H:%M} as {name}")
     return jsonify(ok=True, changed=cur.rowcount)
 
@@ -844,6 +962,7 @@ def api_reset():
     conn.commit()
     conn.execute("VACUUM")
     conn.close()
+    invalidate_device_totals()
     log(f"energy log reset: {n} readings deleted")
     return jsonify(ok=True, deleted=n)
 
@@ -920,8 +1039,19 @@ if __name__ == "__main__":
             sys.exit("config.json missing. Copy config.example.json and fill it in.")
         with open(CONFIG_PATH) as f:
             cfg = json.load(f)
+        apply_dps(cfg.get("dps"))
         plug = TuyaPlug(cfg)
     load_state(cfg)
+
+    def warm_device_totals():
+        # The first full scan of a big database takes a few seconds: do it now,
+        # not on the first page load
+        conn = db()
+        try:
+            device_totals(conn, cfg.get("poll_seconds", 10), state["price_per_kwh"])
+        finally:
+            conn.close()
+    threading.Thread(target=warm_device_totals, daemon=True).start()
     threading.Thread(target=loop, args=(cfg.get("poll_seconds", 10),), daemon=True).start()
     port = cfg.get("port", 8080)
     log(f"listening on port {port}, plug at {cfg.get('ip', 'demo')}")

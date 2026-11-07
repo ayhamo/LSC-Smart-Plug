@@ -118,7 +118,7 @@ packages on first run.
 
 ## Docker
 
-`docker/` has a `Dockerfile` (python:3.13-alpine, runs as uid 1000) and a
+`docker/` has a `Dockerfile` (python:3.14-alpine, runs as uid 1000) and a
 `docker-compose.yml`. Layout on the host:
 
 ```
@@ -235,7 +235,10 @@ Everything the page does goes through these endpoints, so you can script it
 `config.json` fields: `device_id`, `local_key`, `ip`, `version`, `poll_seconds`
 (5), `port` (8080), `dps` (data point numbers: switch 1, current 18, power 19,
 voltage 20), `price_per_kwh`. If the wizard's `snapshot.json` shows different
-DP numbers for your plug, edit `dps`.
+DP numbers for your plug, edit `dps`. Besides the four above, `dps` also accepts
+`countdown` (9), `fault` (26), `power_on` (38), `overcurrent` (39), `led` (40),
+`child_lock` (41), `cycle` (42), `random` (43) and `inching` (44); leave out any
+you don't need to change.
 
 ## Things not to do
 
