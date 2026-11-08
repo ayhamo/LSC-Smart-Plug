@@ -225,8 +225,36 @@ class TestTwoPlugs(Base):
         self.assertEqual(self.c.get("/api/status?plug=9").status_code, 404)
         self.assertEqual(self.post("/api/switch", plug="9", on=True)[0], 404)
 
+    def test_empty_or_unknown_plug_never_means_first(self):
+        for pid in ("", "9"):
+            self.assertEqual(self.post("/api/switch", plug=pid, on=True)[0], 404)
+            self.assertEqual(self.post("/api/device", plug=pid, setting="countdown", value=60)[0], 404)
+        self.assertEqual(self.c.post("/api/switch?plug=", json={"on": True}).status_code, 404)
+        ps.PLUGS["1"].refresh()
+        self.assertFalse(self.status("1")["status"]["on"])
+
+    def test_confirm_switch_null_keeps_asking(self):
+        ps.state["plugs"]["1"]["confirm_switch"] = None
+        ps.save_state()
+        ps.init(json.loads(json.dumps(self.raw)), demo=True, data_dir=self.dir)
+        self.assertTrue(self.status("1")["plug"]["confirm_switch"])
+
+    def test_schedule_not_kept_when_save_fails(self):
+        real = ps.save_state
+
+        def broken():
+            raise OSError("disk full")
+        ps.save_state = broken
+        try:
+            code, j = self.post("/api/schedules", plug="1", time="07:00", action="on", days=["mon"])
+        finally:
+            ps.save_state = real
+        self.assertEqual((code, j["ok"]), (500, False))
+        self.assertEqual(ps.state["plugs"]["1"]["schedules"], [])
+
     def test_default_plug_is_first(self):
-        self.assertEqual(self.c.get("/api/status").get_json()["plug"], {"id": "1", "name": "Heater"})
+        self.assertEqual(self.c.get("/api/status").get_json()["plug"],
+                         {"id": "1", "name": "Heater", "confirm_switch": True})
 
     def test_readings_in_same_second_kept_per_plug(self):
         now = time.time()
@@ -257,6 +285,20 @@ class TestTwoPlugs(Base):
         r = self.c.post("/api/settings", data='{"price_per_kwh": NaN}', content_type="application/json")
         self.assertEqual(r.status_code, 400)
         self.assertTrue(math.isfinite(ps.state["price_per_kwh"]))
+
+    def test_confirm_switch_per_plug(self):
+        # On by default for every plug; turned off for one plug only; survives a restart
+        self.assertTrue(self.status("1")["plug"]["confirm_switch"])
+        self.assertTrue(self.status("2")["plug"]["confirm_switch"])
+        self.assertEqual(self.post("/api/settings", plug="2", confirm_switch=False), (200, {"ok": True}))
+        self.assertFalse(self.status("2")["plug"]["confirm_switch"])
+        self.assertTrue(self.status("1")["plug"]["confirm_switch"])
+        ps.init(json.loads(json.dumps(self.raw)), demo=True, data_dir=self.dir)
+        self.assertFalse(self.status("2")["plug"]["confirm_switch"])
+        self.assertTrue(self.status("1")["plug"]["confirm_switch"])
+        for bad in ("no", 0, None):
+            self.assertEqual(self.post("/api/settings", plug="2", confirm_switch=bad)[0], 400)
+        self.assertFalse(ps.state["plugs"]["2"]["confirm_switch"])
 
     def test_per_plug_settings(self):
         self.post("/api/settings", plug="2", device="Freezer", power_above_w=200)
@@ -451,6 +493,36 @@ class TestSchedulesAndAlerts(Base):
             ps.run_schedules(p, day.replace(hour=7, second=s))
         self.assertEqual(len(tries), ps.SCHED_TRIES)
         self.assertTrue(any("schedule 07:00" in a["msg"] for a in ps.alerts_log))
+
+    def test_older_schedule_never_runs_after_newer(self):
+        # "on" fails and waits for a retry; "off" five minutes later must win
+        p = ps.PLUGS["1"]
+        self.post("/api/schedules", plug="1", time="22:00", action="on", days=list(ps.DAYS))
+        self.post("/api/schedules", plug="1", time="22:05", action="off", days=list(ps.DAYS))
+        calls, fail = [], [True]
+
+        def sw(on, reason=""):
+            calls.append(on)
+            return "timeout" if fail[0] else None
+        p.switch = sw
+        day = datetime(2026, 11, 9)
+        ps.run_schedules(p, day.replace(hour=21, minute=59))
+        ps.run_schedules(p, day.replace(hour=22, minute=0))        # on: fails
+        fail[0] = False
+        ps.run_schedules(p, day.replace(hour=22, minute=5))        # off is newer: retry of on dropped
+        ps.run_schedules(p, day.replace(hour=22, minute=5, second=5))
+        self.assertEqual(calls, [True, False])
+        # Next day a slow pass catches up 22:00 and 22:05 together: only the newest runs
+        calls.clear()
+        ps.run_schedules(p, day.replace(hour=21, minute=59) + timedelta(days=1))
+        ps.run_schedules(p, day.replace(hour=22, minute=10) + timedelta(days=1))
+        self.assertEqual(calls, [False])
+
+    def test_manual_switch_cancels_schedule_retry(self):
+        p = ps.PLUGS["1"]
+        p.sched_retry = [({"time": "07:00", "action": "on"}, datetime(2026, 11, 9, 7), 1)]
+        self.post("/api/switch", plug="1", on=False)
+        self.assertEqual(p.sched_retry, [])
 
     def test_power_alert_hysteresis(self):
         p = ps.PLUGS["1"]

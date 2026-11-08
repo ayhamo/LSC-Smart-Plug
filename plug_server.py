@@ -588,7 +588,7 @@ DEFAULT_STATE = {
     "alerts": {"notify_url": "", "budget_eur": 0, "monthly_report": False},
     "last_report": "",       # "YYYY-MM" of the month the last report was sent in
     "budget_alerted": "",    # "YYYY-MM" of the month the budget alert was sent in
-    "plugs": {},             # id -> {"name", "device", "schedules", "power_above_w"}
+    "plugs": {},             # id -> {"name", "device", "schedules", "power_above_w", "confirm_switch"}
 }
 state_lock = threading.RLock()
 state = copy.deepcopy(DEFAULT_STATE)
@@ -637,6 +637,9 @@ def load_state(raw_cfg):
         ps.setdefault("device", "AC" if pid == first and "device" not in ps and legacy else
                       (ps.get("name") or PLUGS[pid].config_name))
         ps["power_above_w"] = _num_or(ps.get("power_above_w"), 0)
+        # The page asks "Turn on/off?" before switching (on by default: safer for sensitive devices)
+        # Only an explicit false turns it off (a missing or null value keeps asking)
+        ps["confirm_switch"] = ps.get("confirm_switch") is not False
         good = []
         for s in ps.get("schedules") or []:
             try:
@@ -1189,6 +1192,15 @@ def run_schedules(plug, now=None):
             m += timedelta(minutes=1)
         plug.sched_last = cur
     todo, plug.sched_retry = plug.sched_retry + due, []
+    if len(todo) > 1:
+        # Only the newest due switch counts: running an older one (a retry, or several
+        # caught up at once) after it would leave the plug in the wrong state
+        newest = max(m for _, m, _ in todo)
+        for s, m, _ in todo:
+            if m < newest:
+                log(f"{plug.name}: schedule {s['time']} (turn {s['action']}) skipped, "
+                    f"a newer one is due")
+        todo = [t for t in todo if t[1] == newest][-1:]
     for s, m, tries in todo:
         err = plug.switch(s["action"] == "on", f"(schedule {s['time']})")
         if err is None:
@@ -1250,7 +1262,13 @@ def body():
 
 def pick_plug(b=None):
     """The plug a request is about: ?plug=ID or "plug" in the body; default the first."""
-    pid = request.args.get("plug") or (b or {}).get("plug") or next(iter(PLUGS))
+    pid = request.args.get("plug")
+    if pid is None:
+        pid = (b or {}).get("plug")
+    if pid is None:
+        pid = next(iter(PLUGS))
+    # An empty or wrong id is an error, never "the first plug": a switch must not
+    # reach a plug other than the one asked for
     pid = str(pid)
     if pid not in PLUGS:
         raise ApiError(f"unknown plug '{pid}'", 404)
@@ -1275,11 +1293,12 @@ def api_status():
         schedules = [dict(s) for s in ps["schedules"]]
         alerts_cfg = dict(state["alerts"], power_above_w=ps["power_above_w"])
         price = state["price_per_kwh"]
+        confirm_switch = ps["confirm_switch"]
     # The webhook / topic URL works as a password: never send it back
     alerts_cfg["notify_url"] = mask_url(alerts_cfg.get("notify_url"))
     energy = energy_summary(plug.id, price, st["power_w"] if st and st["on"] else 0,
                             cfg["poll_seconds"], request.args.get("device", ""))
-    return jsonify(plug={"id": plug.id, "name": plug.name},
+    return jsonify(plug={"id": plug.id, "name": plug.name, "confirm_switch": confirm_switch},
                    plugs=[p.overview() for p in PLUGS.values()],
                    status=st, error=plug.last["error"], updated=plug.last["ts"],
                    schedules=schedules, alerts_cfg=alerts_cfg, alerts=alerts_log[:10],
@@ -1292,6 +1311,7 @@ def api_switch():
     plug = pick_plug(b)
     if not isinstance(b.get("on"), bool):
         raise ApiError('send {"on": true} or {"on": false}')
+    plug.sched_retry = []      # a manual switch wins over a failed schedule still being retried
     err = plug.switch(b["on"], "(manual)")
     plug.refresh()
     if err:
@@ -1347,6 +1367,7 @@ def api_schedules():
     plug = pick_plug(b)
     with state_lock:
         scheds = plug_state(plug.id)["schedules"]
+        old = copy.deepcopy(scheds)
         if "delete" in b or "toggle" in b:
             ref = b.get("delete", b.get("toggle"))
             idx = next((i for i, s in enumerate(scheds) if s["id"] == ref), None)
@@ -1364,14 +1385,18 @@ def api_schedules():
             s = clean_schedule({k: b.get(k) for k in ("time", "action", "days")})
             scheds.append(s)
             scheds.sort(key=lambda s: s["time"])
-        save_state()
+        try:
+            save_state()
+        except OSError as e:
+            scheds[:] = old       # not saved: don't run it until the next restart either
+            raise ApiError(f"could not save schedules: {e}", 500) from None
     return jsonify(ok=True)
 
 
 @app.post("/api/settings")
 def api_settings():
     """Any subset of: price_per_kwh, notify_url, budget_eur, monthly_report (all plugs);
-    plug_name, device, power_above_w (the plug given by "plug")."""
+    plug_name, device, power_above_w, confirm_switch (the plug given by "plug")."""
     b = body()
     plug = pick_plug(b)
     # Check everything first, so a bad field changes nothing
@@ -1384,6 +1409,10 @@ def api_settings():
         new["power_above_w"] = check_num(b["power_above_w"] or 0, "power limit")
     if "monthly_report" in b:
         new["monthly_report"] = bool(b["monthly_report"])
+    if "confirm_switch" in b:
+        if not isinstance(b["confirm_switch"], bool):
+            raise ApiError("confirm_switch must be true or false")
+        new["confirm_switch"] = b["confirm_switch"]
     if "notify_url" in b:
         url = str(b["notify_url"] or "").strip()
         if URL_MASK not in url:     # the page shows the masked URL; sending it back keeps the saved one
@@ -1405,6 +1434,11 @@ def api_settings():
                 state["alerts"][k] = new[k]
         if "power_above_w" in new:
             ps["power_above_w"] = new["power_above_w"]
+        if "confirm_switch" in new:
+            if new["confirm_switch"] != ps["confirm_switch"]:
+                log(f"{plug.name}: confirm before switching "
+                    f"{'enabled' if new['confirm_switch'] else 'disabled'}")
+            ps["confirm_switch"] = new["confirm_switch"]
         if "device" in new:
             if new["device"] != ps["device"]:
                 log(f"{plug.name}: connected device: {ps['device']} -> {new['device']}")

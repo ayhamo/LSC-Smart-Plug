@@ -31,6 +31,9 @@ budget alerts and a monthly report.
 
 - Several plugs in one program: a tab per plug at the top of the page with its
   on/off state and live watts; rename plugs on the page
+- "Turn on?" / "Turn off?" confirmation before switching, so a stray tap never
+  switches a sensitive device (per plug, on by default; untick "Ask before
+  switching on or off" under the button to switch with one tap)
 - Live W / V / A, refreshed every 5 s
 - Energy log: one row per poll in SQLite, kWh integrated from the readings
 - Cost per hour, per 24 h, today, this month, total, plus a month projection

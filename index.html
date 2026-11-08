@@ -86,6 +86,15 @@
   .plugtabs .dot.on { background:var(--on); } .plugtabs .dot.err { background:var(--err); }
   .plugtabs .w { color:var(--muted); font-size:13px; font-weight:400; }
   .rbtn { padding:3px 10px; font-size:13px; }
+  label.confirm { display:inline-flex; gap:6px; align-items:center; font-size:13px; color:var(--muted); margin-top:8px; }
+  dialog#swdlg { border:1px solid var(--line); border-radius:14px; padding:20px; background:var(--card); color:var(--fg); width:min(92vw, 380px); }
+  dialog#swdlg::backdrop { background:rgba(0,0,0,.55); }
+  #swdlg h3 { margin:0 0 6px; font-size:19px; }
+  #swdlg p { margin:0 0 16px; color:var(--muted); font-size:14px; }
+  #swdlg .btns { display:flex; gap:10px; }
+  #swdlg .btns button { flex:1; padding:12px; font-size:16px; font-weight:600; }
+  #swdlg #sw_yes.on { background:var(--on); border-color:var(--on); color:#fff; }
+  #swdlg #sw_yes.off { background:var(--err); border-color:var(--err); color:#fff; }
 </style>
 </head>
 <body>
@@ -103,7 +112,19 @@
     <div id="faults"></div>
     <button class="toggle off" id="toggle" onclick="toggle()">…</button>
     <div class="muted" id="cdinfo" style="margin-top:6px"></div>
+    <label class="confirm" title="Saved for this plug, on every phone and browser"><input type="checkbox" id="confirm_sw" onchange="setConfirm(this)"> Ask before switching on or off</label>
   </div>
+
+  <dialog id="swdlg" aria-labelledby="sw_title">
+    <form method="dialog">
+      <h3 id="sw_title">Turn off?</h3>
+      <p id="sw_text"></p>
+      <div class="btns">
+        <button value="cancel" id="sw_no" autofocus>Cancel</button>
+        <button value="yes" id="sw_yes">Turn off</button>
+      </div>
+    </form>
+  </dialog>
 
   <div class="col">
   <div class="card">
@@ -117,7 +138,7 @@
   </div>
 
   <div class="card">
-    <h2>Energy &amp; cost <span class="tag">needs this program running</span></h2>
+    <h2>Energy &amp; cost <span class="tag">stored on server</span></h2>
     <div class="devrow">
       <label>Plugged in now <input list="devlist" id="device" maxlength="40" placeholder="e.g. AC"><datalist id="devlist"></datalist>
         <button onclick="saveDevice()">Save</button></label>
@@ -175,7 +196,7 @@
   </div>
 
   <div class="card">
-    <h2>Alerts <span class="tag">needs this program running</span></h2>
+    <h2>Alerts <span class="tag">stored on server</span></h2>
     <div class="muted">Shown here, and sent to Discord (webhook URL) or ntfy if a URL is set. Sent for: power above your limit, plug fault, plug unreachable, plug back online.</div>
     <div class="row">Alert when this plug's power is above <input type="number" id="al_w" min="0"> W <span class="muted">(0 = off)</span></div>
     <div class="row">Alert when this month's cost passes <input type="number" id="al_budget" min="0" step="1"> € <span class="muted">(0 = off, all plugs together)</span></div>
@@ -236,7 +257,7 @@
   </div>
 
   <div class="card">
-    <h2>Weekly schedule <span class="tag">needs this program running</span></h2>
+    <h2>Weekly schedule <span class="tag">stored on server</span></h2>
     <div class="muted">Fixed on/off times. The Tuya app keeps these in its cloud, so here this program runs them instead.</div>
     <div class="row">
       <input type="time" id="stime" value="07:00">
@@ -289,6 +310,7 @@ function setPlug(id) {
   PLUG = id; store.set("plug_id", id);
   VIEW = ""; dirty.clear(); S = null; chartTick = 0;
   $("info").classList.remove("open");
+  $("toggle").textContent = "…"; $("toggle").className = "toggle off";
   refresh(); loadChart();
 }
 function renderPlugTabs(plugs) {
@@ -344,11 +366,48 @@ async function post(url, body = {}) {
   return j;
 }
 const dev = (setting, value) => post("/api/device", {setting, value});
+// Ask "Turn on/off?" first if this plug has that set. Cancel has the focus, so Enter,
+// Esc, a tap outside or a second stray tap never switch anything.
+function askSwitch(on, name) {
+  const d = $("swdlg");
+  if (typeof d.showModal !== "function") return Promise.resolve(confirm(`Turn ${name} ${on ? "ON" : "OFF"}?`));
+  $("sw_title").textContent = `Turn ${on ? "on" : "off"}?`;
+  $("sw_text").textContent = `${name} will be switched ${on ? "ON" : "OFF"} right away.`;
+  const yes = $("sw_yes");
+  yes.textContent = on ? "Turn on" : "Turn off"; yes.className = on ? "on" : "off";
+  d.returnValue = "";
+  return new Promise(res => {
+    d.addEventListener("close", () => res(d.returnValue === "yes"), {once: true});
+    d.showModal(); $("sw_no").focus();
+  });
+}
+$("swdlg").addEventListener("click", e => { if (e.target === $("swdlg")) $("swdlg").close("cancel"); });  // tap on the backdrop
 async function toggle() {
-  const b = $("toggle"), want = !(S && S.on);
+  const b = $("toggle");
+  if (!S || b.disabled) return;          // state not known yet: never guess which way to switch
+  // Fix plug and direction now: what the button shows is what gets sent, even if
+  // the state or the selected tab changes while the question is open
+  const plug = PLUG, name = PLUGNAME, want = !S.on;
+  if (CONFIRM_SW && !(await askSwitch(want, name))) return;
+  if (plug !== PLUG) return;
   b.disabled = true;
   b.textContent = want ? "turning on…" : "turning off…";
-  try { await post("/api/switch", {on: want}); } finally { b.disabled = false; }
+  try {
+    const j = await api("/api/switch", {plug, on: want});
+    if (!j.ok) alert("Failed: " + (j.error || "unknown error"));
+  } finally { b.disabled = false; refresh(); }
+}
+let CONFIRM_SW = true, confSeq = 0;
+async function setConfirm(cb) {
+  const v = cb.checked, plug = PLUG, name = PLUGNAME;
+  if (!v && !confirm(`Switch ${name} with a single tap, without asking first?`)) { cb.checked = true; return; }
+  confSeq++;         // refresh answers asked for before this change must not undo it
+  if (v && plug === PLUG) CONFIRM_SW = true;     // asking again is safe right away
+  const j = await api("/api/settings", {plug, confirm_switch: v});
+  confSeq++;
+  if (plug !== PLUG) return;                     // another tab was picked meanwhile
+  if (!j.ok) { cb.checked = !v; CONFIRM_SW = !v; alert("Failed: " + (j.error || "unknown error")); return; }
+  CONFIRM_SW = v; refresh();
 }
 function setCountdown() { const m = num("cdmin", "Countdown minutes", {min: 1, max: 1440}); if (m != null) dev("countdown", Math.round(m * 60)); }
 async function saveInching() {
@@ -356,26 +415,41 @@ async function saveInching() {
   const j = await dev("inching", {enabled: $("inch_en").checked, seconds: s});
   if (j.ok) saved("inch_s", "inch_en");
 }
+// Timer lists are edited as a whole: never send one built from an unknown or old state.
+// After a change, wait for a status read that started after the plug confirmed it.
+let listBusy = false, listDoneAt = 0;
+function known() {
+  if (!S) { alert("The plug's state isn't loaded yet. Try again in a moment."); return false; }
+  if (listBusy || listDoneAt) { alert("Still saving the last timer change. Try again in a moment."); return false; }
+  return true;
+}
+async function writeList(kind, list) {
+  listBusy = true;
+  try { await dev(kind, list); } finally { listBusy = false; listDoneAt = performance.now(); }
+}
 function addCycle() {
+  if (!known()) return;
   const days = pickDays("cy_days"); if (!days.length) return alert("Pick at least one day");
   const on = num("cy_on", "On minutes", {min: 1, max: 1439, int: true}); if (on == null) return;
   const off = num("cy_off", "Off minutes", {min: 1, max: 1439, int: true}); if (off == null) return;
   if (!$("cy_start").value || !$("cy_end").value) return alert("Set the start and end time");
   const list = [...S.cycle, {enabled:true, days, start:$("cy_start").value, end:$("cy_end").value, on_min:on, off_min:off}];
   if (list.length > 10) return alert("The plug stores at most 10 cycle timers");
-  dev("cycle", list);
+  writeList("cycle", list);
 }
 function addRandom() {
+  if (!known()) return;
   const days = pickDays("rn_days"); if (!days.length) return alert("Pick at least one day");
   if (!$("rn_start").value || !$("rn_end").value) return alert("Set the start and end time");
   const list = [...S.random, {enabled:true, days, start:$("rn_start").value, end:$("rn_end").value}];
   if (list.length > 16) return alert("The plug stores at most 16 random timers");
-  dev("random", list);
+  writeList("random", list);
 }
 function listEdit(kind, i, op) {
+  if (!known() || !S[kind][i]) return;
   const list = S[kind].map(x => ({...x}));
   if (op === "del") list.splice(i, 1); else list[i].enabled = !list[i].enabled;
-  dev(kind, list);
+  writeList(kind, list);
 }
 function addSchedule() {
   const days = pickDays("sc_days"); if (!days.length) return alert("Pick at least one day");
@@ -596,26 +670,35 @@ let busy = false;
 async function refresh() {
   if (busy) return;           // a slow answer is still on its way: don't pile up requests
   busy = true;
-  const want = PLUG, view = VIEW;
+  const want = PLUG, view = VIEW, t0 = performance.now(), cseq = confSeq;
   let d, r;
   try {
-    r = await fetch("/api/status?" + (want ? "plug=" + encodeURIComponent(want) + "&" : "") + "device=" + encodeURIComponent(view));
-    d = await r.json();
+    // Give up on a hung answer (e.g. a stuck proxy), else `busy` would stop all refreshes
+    const ac = new AbortController(), tm = setTimeout(() => ac.abort(), 20000);
+    try {
+      r = await fetch("/api/status?" + (want ? "plug=" + encodeURIComponent(want) + "&" : "") + "device=" + encodeURIComponent(view), {signal: ac.signal});
+      d = await r.json();
+    } finally { clearTimeout(tm); }
   } catch { d = null; }
   busy = false;
   // A tab or device was picked while this was loading: drop the old answer and ask
   // for the one now selected (that click's own refresh was skipped above)
   if (PLUG !== want || VIEW !== view) return refresh();
-  if (r && r.status === 404 && PLUG) { PLUG = ""; return refresh(); }   // plug was removed from config.json
+  if (r && r.status === 404 && PLUG) {   // plug was removed from config.json: forget everything about it
+    PLUG = ""; S = null; $("toggle").textContent = "…"; $("toggle").className = "toggle off";
+    return refresh();
+  }
   if (!r || !r.ok || !d || !d.plug) { $("err").textContent = "Program not reachable"; return; }
   const first = !PLUG;
   PLUG = d.plug.id; PLUGNAME = d.plug.name;
+  if (cseq === confSeq) { CONFIRM_SW = d.plug.confirm_switch !== false; $("confirm_sw").checked = CONFIRM_SW; }
   if (first) { store.set("plug_id", PLUG); loadChart(); }
   renderPlugTabs(d.plugs);
   $("pname").textContent = d.plug.name;
   document.title = d.plugs.length > 1 ? `${d.plug.name} · Smart Plug` : d.plug.name;
   $("exp_every").style.display = d.plugs.length > 1 ? "" : "none";
   S = d.status;
+  if (listDoneAt && t0 > listDoneAt) listDoneAt = 0;     // this answer includes the last timer change
   $("err").textContent = d.error ? "Plug not reachable: " + d.error : "";
   $("updated").textContent = d.updated ? "updated " + new Date(d.updated*1000).toLocaleTimeString() : "no data yet";
   if (S) {
@@ -632,7 +715,7 @@ async function refresh() {
     renderList($("rn_list"), S.random, "random", x => `<b>${esc(x.start)}–${esc(x.end)}</b> random <span class="muted">(${dayText(x.days)})</span>`);
   } else {
     $("w").textContent = $("v").textContent = $("a").textContent = "–";
-    $("toggle").textContent = "…";
+    if (!$("toggle").disabled) { $("toggle").textContent = "…"; $("toggle").className = "toggle off"; }
   }
   const e = d.energy;
   renderDevices(e);
