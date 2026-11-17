@@ -752,6 +752,10 @@ _db_init_lock = threading.Lock()
 def db():
     global _db_ready
     conn = sqlite3.connect(DB_PATH, timeout=15)
+    # The 7/30-day totals run window functions over ~500k readings. With temp files
+    # SQLite wrote ~25 MB to /var/tmp (the server's SSD) per refresh, every 30 s while
+    # a page is open. In RAM it costs ~10 MB for the length of the query.
+    conn.execute("PRAGMA temp_store=MEMORY")
     if not _db_ready:
         with _db_init_lock:
             if not _db_ready:

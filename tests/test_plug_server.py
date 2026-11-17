@@ -560,6 +560,7 @@ class TestSchedulesAndAlerts(Base):
             n = conn.execute("SELECT COUNT(*) FROM readings WHERE plug = '1'").fetchone()[0]
             self.assertGreaterEqual(n, 1)
             self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            self.assertEqual(conn.execute("PRAGMA temp_store").fetchone()[0], 2)   # MEMORY
         finally:
             conn.close()
         first = ps._writer
