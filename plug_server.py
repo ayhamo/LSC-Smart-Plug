@@ -795,16 +795,48 @@ def _init_db(conn):
     conn.commit()
 
 
+# One connection that stays open for the poll loops' inserts. Opening and closing a
+# connection per reading made SQLite checkpoint the WAL and sync the disk on every
+# close (every few seconds per plug), several MB per minute on the server's SSD.
+# synchronous=NORMAL is safe with WAL: the database can't be corrupted, a power cut
+# only loses the last few seconds of readings.
+_writer = None
+_writer_path = None
+_writer_lock = threading.Lock()
+
+
+def close_writer():
+    global _writer, _writer_path
+    with _writer_lock:
+        if _writer is not None:
+            try:
+                _writer.close()
+            except sqlite3.Error:
+                pass
+        _writer = _writer_path = None
+
+
 def log_reading(pid, st, elapsed_s, device):
+    global _writer, _writer_path
     p = st.get("power_w") or 0.0
-    conn = db()
-    try:
-        conn.execute("INSERT OR REPLACE INTO readings VALUES (?,?,?,?,?,?,?,?)",
-                     (pid, int(time.time()), int(st["on"]), p, st.get("voltage_v"),
-                      st.get("current_a"), p * elapsed_s / 3600.0, device))
-        conn.commit()
-    finally:
-        conn.close()
+    row = (pid, int(time.time()), int(st["on"]), p, st.get("voltage_v"),
+           st.get("current_a"), p * elapsed_s / 3600.0, device)
+    with _writer_lock:
+        if _writer is None or _writer_path != DB_PATH:
+            if _writer is not None:
+                _writer.close()
+                _writer = None
+            db().close()                     # creates or upgrades the database first
+            _writer = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
+            _writer.execute("PRAGMA synchronous=NORMAL")
+            _writer_path = DB_PATH
+        try:
+            _writer.execute("INSERT OR REPLACE INTO readings VALUES (?,?,?,?,?,?,?,?)", row)
+            _writer.commit()
+        except sqlite3.Error:
+            _writer.close()                  # reopen on the next reading
+            _writer = _writer_path = None
+            raise
 
 
 def where(pid, device=""):
@@ -1621,6 +1653,7 @@ def init(raw_cfg=None, demo=False, data_dir=None):
     with alerts_lock:
         _alerts.clear()
         alerts_log.clear()
+    close_writer()
     _db_ready = False
     invalidate_energy()
     load_state(raw_cfg)

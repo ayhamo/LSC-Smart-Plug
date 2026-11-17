@@ -552,6 +552,24 @@ class TestSchedulesAndAlerts(Base):
         self.assertEqual(msgs[:2], ["Fridge: plug is reachable again", "Fridge: plug is not reachable"])
         self.assertEqual(p.last["fail_count"], 0)
 
+    def test_reading_visible_at_once_and_writer_follows_db_path(self):
+        st = {"on": True, "power_w": 100.0, "voltage_v": 230.0, "current_a": 0.4}
+        ps.log_reading("1", st, 5, "AC")
+        conn = ps.db()
+        try:   # a separate reader sees it without waiting for a checkpoint
+            n = conn.execute("SELECT COUNT(*) FROM readings WHERE plug = '1'").fetchone()[0]
+            self.assertGreaterEqual(n, 1)
+            self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+        finally:
+            conn.close()
+        first = ps._writer
+        ps.DB_PATH = os.path.join(self.dir, "other.db")
+        ps._db_ready = False
+        ps.log_reading("1", st, 5, "AC")
+        self.assertIsNot(ps._writer, first)
+        self.assertEqual(ps._writer_path, ps.DB_PATH)
+        ps.close_writer()
+
     def test_db_error_is_not_plug_failure(self):
         p = ps.PLUGS["1"]
         ps.DB_PATH = os.path.join(self.dir, "missing", "x.db")
